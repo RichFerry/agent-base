@@ -1,0 +1,15 @@
+[project]
+# 内核本身只使用 Python 标准库；真实模型 HTTP/SSE 也不要求额外依赖。
+name = "agent-kernel"
+version = "0.1.0"
+description = "Behavioral Python port skeleton of the Claude Code Agent Kernel"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# 测试依赖保持独立，安装时可使用 `pip install -e '.[test]'`。
+test = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
