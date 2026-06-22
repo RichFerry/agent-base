@@ -1,0 +1,6 @@
+{
+  "name": "stdio-echo",
+  "description": "Local-only stdio MCP smoke fixture. This is not a complete MCP config standard.",
+  "command": "python3",
+  "args": ["examples/mcp/stdio_echo_server.py"]
+}

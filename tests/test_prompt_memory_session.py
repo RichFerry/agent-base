@@ -85,6 +85,7 @@ def test_prompt_composer_dynamic_sections_follow_source_order(tmp_path: Path) ->
 
     assert dynamic_tail[0].startswith("# Session-specific guidance")
     assert dynamic_tail[1].startswith("# auto memory")
+    assert "Remember the repo conventions." not in dynamic_tail[1]
     assert dynamic_tail[2].startswith("# Environment")
     assert dynamic_tail[3].startswith("# Language")
     assert dynamic_tail[4].startswith("# MCP Server Instructions")

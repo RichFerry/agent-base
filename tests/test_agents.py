@@ -65,11 +65,16 @@ def test_query_engine_registers_agent_tool_and_sdk_init_agents(tmp_path: Path) -
     init = engine.get_system_init_message()
     agent_tool = next(tool for tool in engine.tools if isinstance(tool, AgentTool))
     prompt = asyncio.run(agent_tool.prompt())
+    spec = asyncio.run(agent_tool.to_api_spec())
+    properties = spec["input_schema"]["properties"]
 
     assert "Task" in init["tools"]
     assert "general-purpose" in init["agents"]
     assert "Launch a new agent to handle complex, multi-step tasks autonomously." in prompt
     assert "- general-purpose:" in prompt
+    assert "worktree" not in prompt
+    assert "isolation" not in prompt
+    assert {"team_name", "mode", "isolation", "cwd"}.isdisjoint(properties)
 
 
 def test_custom_tool_list_is_not_mutated_with_agent_tool(tmp_path: Path) -> None:
@@ -98,6 +103,31 @@ def test_resolve_agent_tools_filters_disallowed_and_allowlist(tmp_path: Path) ->
     resolved = resolve_agent_tools(loaded, [BashTool(), FileReadTool(), FileWriteTool(), EditTool()])
 
     assert [tool.name for tool in resolved] == ["Bash", "Read"]
+
+
+def test_agent_tool_rejects_v01_unsupported_options(tmp_path: Path) -> None:
+    """验证 v0.1 kernel 明确拒绝未实现的 AgentTool 扩展字段。"""
+    config = _make_config(tmp_path)
+    tool = AgentTool(load_agents(config), config=config)
+    context = ToolUseContext(config=config, tools=[tool])
+    base_input = {
+        "description": "Boundary check",
+        "prompt": "Do the work.",
+        "subagent_type": "general-purpose",
+    }
+    cases = (
+        ("team_name", "team-a", "Agent Teams are not implemented"),
+        ("mode", "plan", "permission mode override is not implemented"),
+        ("isolation", "worktree", "isolation overrides are not implemented"),
+        ("cwd", str(config.cwd), "cwd override is not implemented"),
+    )
+
+    for field_name, value, expected_message in cases:
+        result = asyncio.run(tool.validate_input({**base_input, field_name: value}, context))
+
+        assert result.result is False
+        assert result.message is not None
+        assert expected_message in result.message
 
 
 def test_agent_tool_sync_subagent_runs_nested_query_and_returns_result(tmp_path: Path) -> None:

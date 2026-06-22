@@ -2,7 +2,8 @@
 
 定义来源包括内置 agent、KernelConfig 和项目 Markdown frontmatter，同名项目定义可
 覆盖内置项。AgentDefinition 统一 prompt、model、tools/disallowed_tools、skills、MCP、
-permission、max_turns、background、memory 和 isolation 等字段。
+permission、max_turns、background 和 memory 等字段；v0.1 kernel 不实现 remote/worktree
+isolation、Agent Teams 或 cwd 覆盖。
 
 执行路径：AgentTool 校验 ``subagent_type`` 和参数，解析子工具集，触发 SubagentStart
 hook，随后 ``run_subagent`` 创建隔离 ToolUseContext 并复用核心 ``query()``。同步模式
@@ -552,7 +553,6 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.)
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple Agent tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
-- You can optionally set `isolation: "worktree"` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.
 
 ## When to fork
 
@@ -560,7 +560,7 @@ Fork yourself (omit `subagent_type`) when the intermediate tool output isn't wor
 - **Research**: fork open-ended questions. If research can be broken into independent questions, launch parallel forks in one message. A fork beats a fresh subagent for this — it inherits context and shares your cache.
 - **Implementation**: prefer to fork implementation work that requires more than a couple of edits. Do research before jumping to implementation.
 
-Forks are cheap because they share your prompt cache. Don't set `model` on a fork — a different model can't reuse the parent's cache. Pass a short `name` (one or two words, lowercase) so the user can see the fork in the teams panel and steer it mid-run.
+Forks are cheap because they share your prompt cache. Don't set `model` on a fork — a different model can't reuse the parent's cache. Pass a short `name` (one or two words, lowercase) so the user can see the fork in background task tracking and steer it mid-run.
 
 **Don't peek.** The tool result includes an `output_file` path — do not Read or tail it unless the user explicitly asks for a progress check. You get a completion notification; trust it. Reading the transcript mid-flight pulls the fork's tool noise into your context, which defeats the point of forking.
 
@@ -646,7 +646,6 @@ Usage notes:
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent
 - If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 - If the user specifies that they want you to run agents "in parallel", you MUST send a single message with multiple Agent tool use content blocks. For example, if you need to launch both a build-validator agent and a test-runner agent in parallel, send a single message with both tool calls.
-- You can optionally set `isolation: "worktree"` to run the agent in a temporary git worktree, giving it an isolated copy of the repository. The worktree is automatically cleaned up if the agent makes no changes; if changes are made, the worktree path and branch are returned in the result.
 
 ## Writing the prompt
 
@@ -1063,10 +1062,6 @@ class AgentTool(Tool):
         "model": str,
         "run_in_background": bool,
         "name": str,
-        "team_name": str,
-        "mode": str,
-        "isolation": str,
-        "cwd": str,
     }
     required_fields = ("description", "prompt")
 
@@ -1114,16 +1109,15 @@ class AgentTool(Tool):
             agent_type = agent_type or "general-purpose"
             if agent_type not in self.agents:
                 return ValidationResult(False, f"Agent type '{agent_type}' not found. Available agents: {', '.join(self.agents)}", 3)
-        if input.get("team_name"):
-            return ValidationResult(False, "Agent Teams are not implemented in this Python kernel. Omit team_name to spawn a subagent.", 4)
-        if input.get("isolation") == "remote":
-            return ValidationResult(False, 'Remote agent isolation is not implemented in this Python kernel.', 5)
-        if input.get("isolation") == "worktree":
-            return ValidationResult(False, 'Worktree isolation is not implemented in this Python kernel.', 6)
-        if input.get("cwd"):
-            cwd = Path(input["cwd"]).expanduser()
-            if not cwd.is_absolute():
-                return ValidationResult(False, "cwd must be an absolute path.", 7)
+        unsupported_fields = (
+            ("team_name", "Agent Teams are not implemented in this Python kernel. Omit team_name to spawn a subagent."),
+            ("mode", "Agent permission mode override is not implemented in this Python kernel. Omit mode to spawn a subagent."),
+            ("isolation", "Agent isolation overrides are not implemented in this Python kernel. Omit isolation to spawn a subagent."),
+            ("cwd", "Agent cwd override is not implemented in this Python kernel. Omit cwd to spawn a subagent."),
+        )
+        for offset, (field_name, message) in enumerate(unsupported_fields, start=4):
+            if field_name in input and input[field_name] is not None:
+                return ValidationResult(False, message, offset)
         return ValidationResult(True)
 
     async def check_permissions(self, input: dict, context: ToolUseContext) -> PermissionDecision:
@@ -1256,10 +1250,6 @@ class AgentTool(Tool):
                     "model": {"type": "string", "enum": ["sonnet", "opus", "haiku"], "description": "Optional model override for this agent."},
                     "run_in_background": {"type": "boolean", "description": "Set to true to run this agent in the background."},
                     "name": {"type": "string", "description": "Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running."},
-                    "team_name": {"type": "string", "description": "Team name for spawning. Uses current team context if omitted."},
-                    "mode": {"type": "string", "description": 'Permission mode for spawned teammate (e.g., "plan" to require plan approval).'},
-                    "isolation": {"type": "string", "enum": ["worktree"], "description": 'Isolation mode. "worktree" creates a temporary git worktree.'},
-                    "cwd": {"type": "string", "description": "Absolute path to run the agent in."},
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": False,

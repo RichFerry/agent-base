@@ -221,3 +221,33 @@ def test_skill_permission_ask_denies_and_bypass_allows_side_effect_skill(tmp_pat
     assert "Execute skill: danger" in denied_block["content"]
     assert allowed_block.get("is_error") is not True
     assert allowed_block["content"] == "Launching skill: danger"
+
+
+def test_forked_skill_returns_not_implemented_tool_result(tmp_path: Path) -> None:
+    """验证 forked skill 在 Python kernel 中保持明确未实现语义。"""
+    config = KernelConfig(
+        cwd=tmp_path / "repo",
+        config_home=tmp_path / ".claude",
+        skills=(
+            SkillConfig(
+                name="forked-echo",
+                description="Forked echo",
+                content="Echo in a fork.",
+                context="fork",
+            ),
+        ),
+    )
+    config.cwd.mkdir()
+    provider = FakeModelProvider(
+        [
+            [{"type": "tool_use", "id": "toolu_skill", "name": "Skill", "input": {"skill": "forked-echo"}}],
+            "done",
+        ]
+    )
+    engine = QueryEngine(model_provider=provider, config=config)
+
+    events = asyncio.run(_collect(engine.submit_message("run forked skill", max_turns=2)))
+    block = next(event for event in events if event.get("type") == "user")["message"]["content"][0]
+
+    assert block["is_error"] is True
+    assert "Forked skill execution is not implemented in this Python kernel." in block["content"]

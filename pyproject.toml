@@ -1,14 +1,24 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 # 内核本身只使用 Python 标准库；真实模型 HTTP/SSE 也不要求额外依赖。
 name = "agent-kernel"
-version = "0.1.0"
-description = "Behavioral Python port skeleton of the Claude Code Agent Kernel"
+version = "0.3.0"
+description = "Behavioral Python port of the Claude Code Agent Kernel with a local runner"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.scripts]
+agent-kernel-local = "examples.local_agent:main"
 
 [project.optional-dependencies]
 # 测试依赖保持独立，安装时可使用 `pip install -e '.[test]'`。
 test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["agent_kernel*", "examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

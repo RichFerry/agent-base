@@ -156,11 +156,14 @@ def _extract_description(markdown: str, fallback: str) -> str:
 
 def _skill_search_dirs(config: KernelConfig) -> list[Path]:
     """完成 ``_skill_search_dirs`` 对应的skill 扩展内部步骤。"""
-    dirs = [
-        Path(config.cwd) / ".claude" / "skills",
-        Path(config.config_home) / "skills",
-        *[Path(path) for path in config.skill_paths],
-    ]
+    if getattr(config, "_agent_kernel_skill_paths_only", False):
+        dirs = [Path(path) for path in config.skill_paths]
+    else:
+        dirs = [
+            Path(config.cwd) / ".claude" / "skills",
+            Path(config.config_home) / "skills",
+            *[Path(path) for path in config.skill_paths],
+        ]
     result: list[Path] = []
     seen: set[Path] = set()
     for directory in dirs:

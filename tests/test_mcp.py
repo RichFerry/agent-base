@@ -18,6 +18,7 @@ from agent_kernel.mcp import (
 )
 from agent_kernel.model_provider import AnthropicModelProvider, FakeModelProvider
 from agent_kernel.query_engine import QueryEngine
+from examples.local_agent import load_mcp_fixture
 
 
 async def _collect(iterator):
@@ -76,6 +77,20 @@ def test_query_engine_registers_mcp_tools_and_sdk_init_lists_server(tmp_path: Pa
     assert tool.is_read_only({}) is True
     assert init["mcp_servers"] == [{"name": "github.com server", "status": "connected"}]
     assert "Use issue numbers exactly." in "\n\n".join(system_prompt)
+
+
+def test_local_mcp_fixture_loader_builds_connected_client() -> None:
+    """验证 local runner MCP fixture 复用 MCPClientConfig 注入形态。"""
+    fixture_path = Path(__file__).parents[1] / "examples" / "mcp" / "echo-mcp.json"
+
+    client = load_mcp_fixture(fixture_path)
+    result = client.call_tool_handler("echo", {"text": "hello"}) if client.call_tool_handler else None
+
+    assert client.name == "local-echo"
+    assert client.type == "connected"
+    assert client.tools[0]["name"] == "echo"
+    assert client.resources[0]["uri"] == "fixture://local-echo/readme"
+    assert result == {"structuredContent": {"echo": "hello", "source": "local-mcp-fixture"}}
 
 
 def test_mcp_tool_use_executes_handler_and_returns_tool_result(tmp_path: Path) -> None:

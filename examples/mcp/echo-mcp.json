@@ -1,0 +1,39 @@
+{
+  "name": "local-echo",
+  "instructions": "Local smoke-test MCP fixture. Use only for deterministic local runner demos.",
+  "tools": [
+    {
+      "name": "echo",
+      "description": "Echo a text value through a local MCP fixture.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "Text to echo"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "title": "Echo"
+      },
+      "result": {
+        "structuredContent": {
+          "echo": "{text}",
+          "source": "local-mcp-fixture"
+        }
+      }
+    }
+  ],
+  "resources": [
+    {
+      "uri": "fixture://local-echo/readme",
+      "name": "Local Echo MCP Fixture",
+      "mimeType": "text/plain",
+      "text": "This fixture is local-only and deterministic."
+    }
+  ]
+}

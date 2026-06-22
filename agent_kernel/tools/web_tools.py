@@ -565,7 +565,7 @@ class WebSearchTool(Tool):
             on_progress({"type": "query_update", "query": query})
         handler = getattr(context, "web_search_handler", None)
         if handler is None:
-            raise RuntimeError("WebSearch requires a web_search_handler to be configured in this Python kernel.")
+            raise RuntimeError("WebSearch is not configured. Provide a web_search_handler or configure the local runner search provider.")
         raw_result = await _maybe_call(handler, args)
         duration_seconds = time.perf_counter() - start
         output = _normalise_search_results(raw_result, query, duration_seconds)

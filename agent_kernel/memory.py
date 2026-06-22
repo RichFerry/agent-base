@@ -4,9 +4,10 @@ Memory 与 transcript 不同：transcript 保存逐轮消息，memory 保存跨 
 项目知识。目录键优先基于 git root，否则使用 cwd，经 sanitize 后落在
 ``<config_home>/projects/<project>/memory``。
 
-``MEMORY.md`` 是入口索引，加载时限制体积并包装成源码同形 system section；memory
-目录不存在时可按需创建，但读取不会凭空写内容。Kairos/daily log 使用日期路径，可由
-feature/config 开启；默认 agent prompt 只加载入口文件。
+``MEMORY.md`` 是入口索引，显式内容包装时会限制体积并包装成源码同形 system section；
+memory 目录不存在时可按需创建，但读取不会凭空写内容。Kairos/daily log 使用日期路径，
+可由 feature/config 开启；v0.1 默认 agent prompt 只加载 memory 路径和使用规则，不自动
+内联入口文件内容。
 
 本模块只做文件发现与文本包装，不负责从对话自动提取 memory，也不参与 compact。
 PromptComposer 决定最终是否把返回内容放进 system prompt。
@@ -259,7 +260,7 @@ class MemoryLoader:
         return lines
 
     def load_memory_prompt(self) -> str | None:
-        """读取 MEMORY.md；缺失或空文件不产生 prompt section。"""
+        """构造默认 memory 系统提示；v0.1 不自动内联 MEMORY.md 内容。"""
         if not self.config.auto_memory_enabled:
             return None
         memory_dir = self.get_auto_mem_path()
