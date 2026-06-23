@@ -27,8 +27,8 @@ def test_pyproject_packaging_metadata_contract() -> None:
 
     assert pyproject["build-system"]["requires"] == ["setuptools>=61", "wheel"]
     assert project["name"] == "agent-kernel"
-    assert project["version"] == "0.3.0"
-    assert "Agent Kernel" in project["description"]
+    assert project["version"] == "0.4.0"
+    assert "agent kernel" in project["description"].lower()
     assert project["requires-python"] == ">=3.11"
     assert project["dependencies"] == []
     assert project["scripts"] == {"agent-kernel-local": "examples.local_agent:main"}
@@ -51,6 +51,9 @@ def test_local_runner_help_starts_without_model_credentials() -> None:
     assert "--enable-web-search" in result.stdout
     assert "--enable-web-fetch" in result.stdout
     assert "--mcp-fixture" in result.stdout
+    assert "--mcp-config" in result.stdout
+    assert "--list-sessions" in result.stdout
+    assert "--memory-status" in result.stdout
 
 
 def test_editable_install_exposes_local_runner_console_script(tmp_path: Path) -> None:
@@ -128,3 +131,4 @@ def test_editable_install_exposes_local_runner_console_script(tmp_path: Path) ->
     assert "Run one prompt through the local Python Agent Kernel." in help_result.stdout
     assert "--skills-dir" in help_result.stdout
     assert "--mcp-fixture" in help_result.stdout
+    assert "--mcp-config" in help_result.stdout

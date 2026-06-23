@@ -39,7 +39,7 @@ from .messages import (
     ensure_tool_result_pairing,
     normalize_messages_for_api,
 )
-from .model_provider import AnthropicAPIError, AnthropicModelProvider, FakeModelProvider, ModelProvider, normalize_anthropic_stream_events
+from .model_provider import AnthropicAPIError, AnthropicModelProvider, FakeModelProvider, ModelProvider, OpenAIChatModelProvider, OpenAIResponsesModelProvider, build_model_provider_from_env, normalize_anthropic_stream_events
 from .mcp import (
     ListMcpResourcesTool,
     MCPTool,
@@ -125,6 +125,8 @@ __all__ = [
     "MultiEditTool",
     "NotebookEditTool",
     "OutputStyleConfig",
+    "OpenAIChatModelProvider",
+    "OpenAIResponsesModelProvider",
     "PermissionDecision",
     "PromptComposer",
     "QueryEngine",
@@ -150,6 +152,7 @@ __all__ = [
     "build_sdk_status_message",
     "build_system_init_message",
     "build_mcp_tool_name",
+    "build_model_provider_from_env",
     "compact_conversation",
     "create_attachment_message",
     "create_assistant_message",

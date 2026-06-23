@@ -17,7 +17,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 import re
+import select
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
 from .config import MCPClientConfig
@@ -27,6 +32,11 @@ from .tools.base import Tool, ToolResult, ToolUseContext, ValidationResult
 
 
 MAX_MCP_DESCRIPTION_LENGTH = 2_000
+MCP_CONFIG_ENV = "AGENT_KERNEL_MCP_CONFIG"
+
+
+class MCPConfigurationError(RuntimeError):
+    """Raised when an MCP config cannot be loaded into connected clients."""
 
 
 def normalize_name_for_mcp(name: str) -> str:
@@ -83,6 +93,257 @@ def find_mcp_client_config(configs: tuple[MCPClientConfig, ...], server_name: st
         if normalize_name_for_mcp(client.name) == normalized:
             return client
     return None
+
+
+class StdioMCPClient:
+    """Minimal stdio JSON-RPC client for local-only MCP server configs."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        command: list[str],
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        self.name = name
+        self.command = command
+        self.cwd = cwd
+        self.env = env
+        self.timeout_seconds = timeout_seconds
+        self.process: subprocess.Popen[str] | None = None
+        self.next_id = 1
+        self.calls: list[dict[str, Any]] = []
+
+    def start(self) -> None:
+        """Start the configured local stdio process."""
+        if not self.command or not self.command[0]:
+            raise MCPConfigurationError(f'MCP server "{self.name}" command is empty.')
+        self.process = subprocess.Popen(
+            self.command,
+            cwd=str(self.cwd) if self.cwd is not None else None,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        """Send one JSON-RPC request and wait for the matching response."""
+        if self.process is None:
+            self.start()
+        if self.process is None or self.process.stdin is None or self.process.stdout is None:
+            raise RuntimeError(f'MCP server "{self.name}" is not connected.')
+        if self.process.poll() is not None:
+            raise RuntimeError(f'MCP server "{self.name}" exited before {method}.')
+        message_id = self.next_id
+        self.next_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": message_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            self.process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+        except BrokenPipeError as exc:
+            raise RuntimeError(f'MCP server "{self.name}" stdin closed.') from exc
+        while True:
+            readable, _, _ = select.select([self.process.stdout], [], [], self.timeout_seconds)
+            if not readable:
+                raise TimeoutError(f'MCP server "{self.name}" did not answer {method}.')
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError(f'MCP server "{self.name}" exited before answering {method}.')
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") != message_id:
+                continue
+            if "error" in response:
+                error = response["error"]
+                if isinstance(error, dict):
+                    raise RuntimeError(str(error.get("message") or error))
+                raise RuntimeError(str(error))
+            return response.get("result")
+
+    def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send one JSON-RPC notification if the process is still alive."""
+        process = self.process
+        if process is None or process.stdin is None or process.poll() is not None:
+            return
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        try:
+            process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return
+
+    def initialize(self) -> dict[str, Any]:
+        """Initialize the MCP server and send the initialized notification."""
+        result = self.request(
+            "initialize",
+            {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "agent-kernel-local", "version": "0.4.0"},
+            },
+        )
+        self.notify("notifications/initialized")
+        return result if isinstance(result, dict) else {}
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        """Return tools exposed by the server."""
+        result = self.request("tools/list", {})
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if not isinstance(tools, list):
+            raise RuntimeError(f'MCP server "{self.name}" returned no tools.')
+        return [tool for tool in tools if isinstance(tool, dict)]
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        """Return resources exposed by the server, or an empty list when unsupported."""
+        try:
+            result = self.request("resources/list", {})
+        except RuntimeError:
+            return []
+        resources = result.get("resources") if isinstance(result, dict) else None
+        return [resource for resource in resources if isinstance(resource, dict)] if isinstance(resources, list) else []
+
+    def call_tool(self, tool_name: str, args: dict[str, Any]) -> Any:
+        """Call a server tool through the JSON-RPC connection."""
+        self.calls.append({"tool_name": tool_name, "args": dict(args)})
+        return self.request("tools/call", {"name": tool_name, "arguments": args})
+
+    def read_resource(self, uri: str) -> Any:
+        """Read a server resource through the JSON-RPC connection."""
+        return self.request("resources/read", {"uri": uri})
+
+    def close(self) -> None:
+        """Shutdown the process and prevent stdio MCP background leaks."""
+        process = self.process
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                self.request("shutdown", {})
+            except Exception:
+                pass
+            self.notify("exit")
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def _resolve_stdio_command(command: str, args: list[str]) -> list[str]:
+    executable = sys.executable if command == "python3" else command
+    return [executable, *args]
+
+
+def _load_json_config(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise MCPConfigurationError(f"Unable to read MCP config: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise MCPConfigurationError(f"MCP config is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise MCPConfigurationError("MCP config must be a JSON object.")
+    return payload
+
+
+def _server_entries_from_config(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw_servers = payload.get("mcpServers")
+    if isinstance(raw_servers, dict):
+        if not raw_servers:
+            raise MCPConfigurationError("MCP config mcpServers must include at least one server.")
+        servers: dict[str, dict[str, Any]] = {}
+        for name, config in raw_servers.items():
+            server_name = str(name)
+            if not isinstance(config, dict):
+                raise MCPConfigurationError(f'MCP server "{server_name}" config must be an object.')
+            servers[server_name] = config
+        return servers
+    # Backward-compatible local smoke shape: {"name": "...", "command": "...", "args": [...]}
+    if payload.get("command"):
+        name = str(payload.get("name") or payload.get("server") or "local")
+        return {name: payload}
+    raise MCPConfigurationError("MCP config must include an mcpServers object.")
+
+
+def load_mcp_config(path: str | Path, *, cwd: str | Path | None = None) -> tuple[MCPClientConfig, ...]:
+    """Load local-only stdio MCP servers into connected MCPClientConfig objects."""
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        raise MCPConfigurationError(f"MCP config does not exist: {config_path}")
+    if not config_path.is_file():
+        raise MCPConfigurationError(f"MCP config path is not a file: {config_path}")
+    payload = _load_json_config(config_path)
+    base_cwd = Path(cwd).expanduser() if cwd is not None else Path.cwd()
+    clients: list[MCPClientConfig] = []
+    started_clients: list[StdioMCPClient] = []
+    try:
+        for server_name, server_config in _server_entries_from_config(payload).items():
+            server_type = str(server_config.get("type") or "stdio")
+            if server_type != "stdio":
+                raise MCPConfigurationError(f'MCP server "{server_name}" uses unsupported type "{server_type}". Only local stdio is supported.')
+            command = str(server_config.get("command") or "").strip()
+            if not command:
+                raise MCPConfigurationError(f'MCP server "{server_name}" must include command.')
+            raw_args = server_config.get("args") or []
+            if not isinstance(raw_args, list):
+                raise MCPConfigurationError(f'MCP server "{server_name}" args must be an array.')
+            raw_env = server_config.get("env") or {}
+            if not isinstance(raw_env, dict):
+                raise MCPConfigurationError(f'MCP server "{server_name}" env must be an object.')
+            server_cwd = Path(server_config["cwd"]).expanduser() if server_config.get("cwd") else base_cwd
+            env = {**os.environ, **{str(key): str(value) for key, value in raw_env.items()}}
+            client = StdioMCPClient(
+                name=server_name,
+                command=_resolve_stdio_command(command, [str(arg) for arg in raw_args]),
+                cwd=server_cwd,
+                env=env,
+            )
+            client.start()
+            started_clients.append(client)
+            client.initialize()
+            tools = client.list_tools()
+            resources = client.list_resources()
+            clients.append(
+                MCPClientConfig(
+                    name=server_name,
+                    instructions=str(server_config.get("instructions") or server_config.get("description") or ""),
+                    type="connected",
+                    tools=tuple(tools),
+                    resources=tuple(resources),
+                    client=client,
+                    call_tool_handler=client.call_tool,
+                    read_resource_handler=client.read_resource if resources else None,
+                )
+            )
+    except Exception:
+        for client in started_clients:
+            client.close()
+        raise
+    return tuple(clients)
+
+
+def close_mcp_clients(clients: tuple[MCPClientConfig, ...]) -> None:
+    """Close any stdio MCP clients attached to connected config objects."""
+    for client_config in clients:
+        client = client_config.client
+        if hasattr(client, "close"):
+            client.close()
 
 
 def transform_mcp_result(result: Any) -> str | list[dict[str, Any]]:

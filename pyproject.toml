@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 # 内核本身只使用 Python 标准库；真实模型 HTTP/SSE 也不要求额外依赖。
 name = "agent-kernel"
-version = "0.3.0"
-description = "Behavioral Python port of the Claude Code Agent Kernel with a local runner"
+version = "0.4.0"
+description = "Behavioral Python agent kernel with a local runner"
 requires-python = ">=3.11"
 dependencies = []
 

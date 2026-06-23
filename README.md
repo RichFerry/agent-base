@@ -11,11 +11,11 @@ shell.
 
 - A core async agent loop: user message, model turn, tool use, tool result, final response.
 - A stable `QueryEngine.submit_message(...)` entry point.
-- Fake and Anthropic-compatible model providers.
+- Fake, Anthropic-compatible, OpenAI Chat, and OpenAI Responses providers.
 - Built-in tools for shell, files, search, todo, WebSearch, and WebFetch.
 - Permission modes limited to `ask` and `bypass`.
 - JSONL transcript, resume support, and SDK-style events.
-- Optional local Skills and MCP fixture integration.
+- Optional local Skills, MCP fixture/config integration, and session/memory CLI helpers.
 - Offline-first test suite.
 
 ## What It Is Not
@@ -43,7 +43,7 @@ agent-kernel-local --help
 Package facts:
 
 - Package name: `agent-kernel`
-- Current version: `0.3.0`
+- Current version: `0.4.0`
 - Python: `>=3.11`
 - Runtime dependencies: none
 
@@ -78,23 +78,42 @@ agent-kernel-local "Reply with one short sentence: agent kernel smoke test."
 
 Without model credentials, real model calls fail early with a clear error.
 
-## Real Model Configuration
+## Model Provider Configuration
 
 Agent Base reads credentials only from environment variables. Do not put API
 keys in source files, fixtures, README examples, logs, or transcripts.
 
+Select a provider with `AGENT_KERNEL_PROVIDER`:
+
+| Provider | Value | Credential fallback |
+| --- | --- | --- |
+| Anthropic-compatible Messages | `anthropic` | `AGENT_KERNEL_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+| OpenAI Chat Completions | `openai-chat` | `AGENT_KERNEL_API_KEY`, `OPENAI_API_KEY` |
+| OpenAI Responses | `openai-responses` | `AGENT_KERNEL_API_KEY`, `OPENAI_API_KEY` |
+
 ```bash
-export ANTHROPIC_AUTH_TOKEN="..."
-export ANTHROPIC_MODEL="..."
+export AGENT_KERNEL_PROVIDER="anthropic"
+export AGENT_KERNEL_API_KEY="..."
+export AGENT_KERNEL_MODEL="..."
 ```
 
-For a custom Anthropic-compatible endpoint:
+Provider-specific environment variables are still supported. For a custom
+Anthropic-compatible endpoint:
 
 ```bash
 export ANTHROPIC_BASE_URL="https://api.example.com/anthropic"
 ```
 
-`ANTHROPIC_API_KEY` is also supported when `ANTHROPIC_AUTH_TOKEN` is not set.
+For OpenAI-compatible modes:
+
+```bash
+export AGENT_KERNEL_PROVIDER="openai-chat"
+export OPENAI_API_KEY="..."
+export OPENAI_MODEL="..."
+```
+
+`AGENT_KERNEL_BASE_URL` can override the provider base URL for compatible
+endpoints.
 
 ## Local Runner
 
@@ -118,6 +137,12 @@ Common commands:
 ```bash
 agent-kernel-local --permission-mode ask "Summarize this project in one sentence."
 agent-kernel-local --repl
+agent-kernel-local --list-sessions
+agent-kernel-local --resume SESSION_ID "Continue from here."
+agent-kernel-local --continue "Continue the latest local session."
+agent-kernel-local --memory-status
+agent-kernel-local --memory-read
+agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
 ```
 
 Permission modes:
@@ -137,6 +162,7 @@ Optional capabilities are not loaded by default.
 | WebFetch HTTP handler | `AGENT_KERNEL_WEB_FETCH_PROVIDER=http` + `--enable-web-fetch` | Disabled |
 | Local Skills | `--skills-dir examples/skills` | Not loaded |
 | MCP fixture | `--mcp-fixture examples/mcp/echo-mcp.json` | Not loaded |
+| MCP stdio config | `--mcp-config examples/mcp/stdio-config.json` or `AGENT_KERNEL_MCP_CONFIG` | Not loaded |
 | MCP stdio smoke | `AGENT_KERNEL_RUN_REAL_MCP_SMOKE=1 python3 -m pytest tests/test_real_mcp_smoke.py -q` | Skipped |
 
 ### WebSearch Stub
@@ -178,6 +204,12 @@ agent-kernel-local \
 
 The example skill lives at `examples/skills/echo/SKILL.md`.
 
+Inspect local skills without calling a model:
+
+```bash
+agent-kernel-local --skills-dir examples/skills --list-skills
+```
+
 ### MCP Fixture
 
 ```bash
@@ -189,6 +221,35 @@ agent-kernel-local \
 
 The fixture is local-only and deterministic. It is not a full MCP configuration
 format and does not start a third-party MCP server.
+
+### MCP Stdio Config
+
+```bash
+agent-kernel-local \
+  --mcp-config examples/mcp/stdio-config.json \
+  --permission-mode bypass \
+  "Call the stdio echo MCP tool with hello."
+```
+
+The v0.4 config loader supports local-only stdio servers shaped as
+`mcpServers.{name}.command`, `args`, `env`, and optional `cwd`. It uses stdlib
+JSON-RPC over stdio and does not support remote MCP, OAuth, SSE, or default
+third-party server startup.
+
+### Sessions and Memory
+
+```bash
+agent-kernel-local --list-sessions
+agent-kernel-local --resume SESSION_ID "Continue this session."
+agent-kernel-local --continue "Continue the latest session."
+agent-kernel-local --memory-status
+agent-kernel-local --memory-read
+agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
+```
+
+Resume reads existing JSONL transcript ordering through `SessionStore`. Memory
+writes are explicit only; there is no automatic memory extraction in v0.4.
+Memory paths must be relative and stay inside the project memory directory.
 
 ### Combined Local Smoke
 
@@ -229,10 +290,12 @@ Important modules:
 
 - `agent_kernel/query_engine.py`: session facade, dependency assembly, transcript writing, SDK event wrappers.
 - `agent_kernel/query.py`: core async agent loop.
-- `agent_kernel/model_provider.py`: fake and Anthropic-compatible providers.
+- `agent_kernel/model_provider.py`: fake, Anthropic-compatible, OpenAI Chat, and OpenAI Responses providers.
+- `agent_kernel/web_adapters.py`: example-layer WebSearch and WebFetch adapters.
 - `agent_kernel/tool_execution.py`: tool lifecycle.
 - `agent_kernel/permissions.py`: ask/bypass permission resolution.
 - `agent_kernel/session.py`: JSONL transcript and resume.
+- `agent_kernel/memory.py`: project memory pathing and prompt helpers.
 - `agent_kernel/mcp.py`: MCP tool/resource wrappers.
 - `agent_kernel/skills.py`: local Skill parsing and Skill tool.
 
@@ -321,12 +384,13 @@ See `docs/smoke-v0.3.md` for setup and safety details.
 - `README.zh-CN.md`: Simplified Chinese README.
 - `READING_GUIDE.md`: suggested source reading order.
 - `docs/release-v0.3.md`: v0.3 release summary and readiness notes.
+- `docs/release-v0.4.md`: v0.4 local CLI readiness notes.
 - `docs/smoke-v0.3.md`: manual real smoke setup.
 - `CHANGELOG.md`: release changelog.
 
 ## Project Status
 
-Current release: `v0.3.0`.
+Current release: `v0.4.0`.
 
 This repository is a kernel and example runner for local experimentation and
 extension. It is designed to keep behavior observable and testable before adding

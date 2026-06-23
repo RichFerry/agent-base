@@ -199,6 +199,7 @@ class KernelConfig:
     mcp_clients: tuple[MCPClientConfig, ...] = ()
     skills: tuple[SkillConfig, ...] = ()
     skill_paths: tuple[Path, ...] = ()
+    skill_discovery_mode: str = "ambient"
     agents: tuple[AgentConfig, ...] = ()
     agent_paths: tuple[Path, ...] = ()
     disable_builtin_agents: bool = False

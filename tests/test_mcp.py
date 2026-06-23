@@ -8,17 +8,23 @@ from __future__ import annotations
 
 from pathlib import Path
 import asyncio
+import json
+
+import pytest
 
 from agent_kernel.config import KernelConfig, MCPClientConfig
 from agent_kernel.mcp import (
+    MCPConfigurationError,
     build_mcp_tool_name,
+    close_mcp_clients,
     get_mcp_display_name,
+    load_mcp_config,
     mcp_info_from_string,
     normalize_name_for_mcp,
 )
 from agent_kernel.model_provider import AnthropicModelProvider, FakeModelProvider
 from agent_kernel.query_engine import QueryEngine
-from examples.local_agent import load_mcp_fixture
+from examples.local_agent import build_local_engine, load_mcp_fixture
 
 
 async def _collect(iterator):
@@ -91,6 +97,107 @@ def test_local_mcp_fixture_loader_builds_connected_client() -> None:
     assert client.tools[0]["name"] == "echo"
     assert client.resources[0]["uri"] == "fixture://local-echo/readme"
     assert result == {"structuredContent": {"echo": "hello", "source": "local-mcp-fixture"}}
+
+
+def test_mcp_stdio_config_loader_registers_tools_and_closes_process(tmp_path: Path) -> None:
+    """Local stdio MCP config can register tools without leaving a process behind."""
+    repo_root = Path(__file__).parents[1]
+    config_path = repo_root / "examples" / "mcp" / "stdio-config.json"
+
+    clients = load_mcp_config(config_path, cwd=repo_root)
+    try:
+        client_config = clients[0]
+        stdio_client = client_config.client
+        result = client_config.call_tool_handler("echo", {"text": "hello"}) if client_config.call_tool_handler else None
+
+        assert client_config.name == "stdio-echo"
+        assert client_config.type == "connected"
+        assert client_config.tools[0]["name"] == "echo"
+        assert result["structuredContent"] == {"echo": "hello", "source": "stdio-mcp-smoke"}
+        assert getattr(stdio_client, "calls") == [{"tool_name": "echo", "args": {"text": "hello"}}]
+    finally:
+        close_mcp_clients(clients)
+
+    process = getattr(stdio_client, "process")
+    assert process is not None
+    assert process.poll() == 0
+
+
+def test_mcp_stdio_config_tool_use_reaches_transcript(tmp_path: Path) -> None:
+    """Runner-style MCP config injection stays on the normal QueryEngine tool path."""
+    repo_root = Path(__file__).parents[1]
+    config_path = repo_root / "examples" / "mcp" / "stdio-config.json"
+    expected_tool_name = build_mcp_tool_name("stdio-echo", "echo")
+    provider = FakeModelProvider(
+        [
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_stdio_config",
+                    "name": expected_tool_name,
+                    "input": {"text": "hello"},
+                }
+            ],
+            "done",
+        ]
+    )
+
+    engine = build_local_engine(
+        cwd=repo_root,
+        config_home=tmp_path / ".claude",
+        model_provider=provider,
+        mcp_config=config_path,
+        permission_mode="bypass",
+        require_api_key=False,
+    )
+    try:
+        result = asyncio.run(_collect(engine.submit_message("call stdio mcp", max_turns=3, sdk_events=True)))
+    finally:
+        close_mcp_clients(getattr(engine, "_agent_kernel_owned_mcp_clients", ()))
+
+    tool_result = next(
+        block
+        for event in result
+        if event.get("type") == "user"
+        for block in event.get("message", {}).get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    )
+
+    assert result[0]["type"] == "system"
+    assert expected_tool_name in result[0]["tools"]
+    assert result[0]["mcp_servers"] == [{"name": "stdio-echo", "status": "connected"}]
+    assert tool_result["tool_use_id"] == "toolu_stdio_config"
+    assert tool_result["content"] == '{"echo":"hello","source":"stdio-mcp-smoke"}'
+    assert result[-1]["type"] == "result"
+    assert result[-1]["is_error"] is False
+    rows = [json.loads(line) for line in engine.session_store.transcript_path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        row.get("type") == "user"
+        and row.get("message", {}).get("content", [{}])[0].get("tool_use_id") == "toolu_stdio_config"
+        for row in rows
+    )
+
+
+def test_mcp_stdio_config_invalid_path_and_type_are_clear(tmp_path: Path) -> None:
+    """Invalid MCP config paths or unsupported server types fail before registering tools."""
+    with pytest.raises(MCPConfigurationError, match="does not exist"):
+        load_mcp_config(tmp_path / "missing.json", cwd=tmp_path)
+
+    empty = tmp_path / "empty-mcp.json"
+    empty.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    with pytest.raises(MCPConfigurationError, match="at least one server"):
+        load_mcp_config(empty, cwd=tmp_path)
+
+    invalid_entry = tmp_path / "invalid-entry-mcp.json"
+    invalid_entry.write_text(json.dumps({"mcpServers": {"broken": "not-an-object"}}), encoding="utf-8")
+    with pytest.raises(MCPConfigurationError, match='MCP server "broken" config must be an object'):
+        load_mcp_config(invalid_entry, cwd=tmp_path)
+
+    invalid = tmp_path / "mcp.json"
+    invalid.write_text(json.dumps({"mcpServers": {"remote": {"type": "http", "command": "server"}}}), encoding="utf-8")
+
+    with pytest.raises(MCPConfigurationError, match="Only local stdio is supported"):
+        load_mcp_config(invalid, cwd=tmp_path)
 
 
 def test_mcp_tool_use_executes_handler_and_returns_tool_result(tmp_path: Path) -> None:

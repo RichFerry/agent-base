@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator, Callable, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 from .messages import (
     AssistantMessage,
@@ -61,6 +62,11 @@ class AnthropicAPIError(RuntimeError):
     pass
 
 
+class OpenAIAPIError(RuntimeError):
+    """Raised when an OpenAI-compatible provider request cannot be normalized."""
+    pass
+
+
 def _endpoint_from_base_url(base_url: str) -> str:
     """完成 ``_endpoint_from_base_url`` 对应的模型调用内部步骤。"""
     normalized = base_url.rstrip("/")
@@ -69,6 +75,26 @@ def _endpoint_from_base_url(base_url: str) -> str:
     if normalized.endswith("/v1"):
         return f"{normalized}/messages"
     return f"{normalized}/v1/messages"
+
+
+def _openai_chat_endpoint_from_base_url(base_url: str) -> str:
+    """Return the Chat Completions endpoint for an OpenAI-compatible base URL."""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1/chat/completions"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/chat/completions"
+    return f"{normalized}/v1/chat/completions"
+
+
+def _openai_responses_endpoint_from_base_url(base_url: str) -> str:
+    """Return the Responses endpoint for an OpenAI-compatible base URL."""
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/v1/responses"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/responses"
+    return f"{normalized}/v1/responses"
 
 
 def _json_schema_for_type(py_type: type | tuple[type, ...]) -> dict[str, Any]:
@@ -121,6 +147,28 @@ def _default_transport(url: str, headers: dict[str, str], body: dict[str, Any], 
     except URLError as exc:
         raise AnthropicAPIError(f"Anthropic API request failed: {exc.reason}") from exc
     return json.loads(payload)
+
+
+def _default_openai_transport(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float) -> dict[str, Any]:
+    """POST JSON to an OpenAI-compatible endpoint using only stdlib."""
+    request = Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = response.read().decode("utf-8")
+    except HTTPError as exc:
+        error_payload = exc.read().decode("utf-8", errors="replace")
+        raise OpenAIAPIError(f"OpenAI-compatible request failed with HTTP {exc.code}: {error_payload}") from exc
+    except URLError as exc:
+        raise OpenAIAPIError(f"OpenAI-compatible request failed: {exc.reason}") from exc
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise OpenAIAPIError("OpenAI-compatible provider returned invalid JSON.") from exc
 
 
 def _raise_if_aborted(abort_signal: Any | None) -> None:
@@ -189,6 +237,59 @@ async def _maybe_await(value):
     if hasattr(value, "__await__"):
         return await value
     return value
+
+
+def _content_to_text(content: Any) -> str:
+    """Convert text or structured tool_result content into stable text."""
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_tool_arguments(raw_arguments: Any, *, provider_name: str) -> dict[str, Any]:
+    """Parse provider-emitted function arguments into internal tool input."""
+    if raw_arguments is None:
+        return {}
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if raw_arguments == "":
+        return {}
+    if not isinstance(raw_arguments, str):
+        raise OpenAIAPIError(f"{provider_name} emitted non-string tool arguments.")
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        raise OpenAIAPIError(f"{provider_name} emitted invalid tool arguments JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise OpenAIAPIError(f"{provider_name} emitted non-object tool arguments JSON.")
+    return parsed
+
+
+def _assistant_text_from_blocks(content: list[dict[str, Any]]) -> str:
+    """Collect text blocks from an internal assistant content list."""
+    return "\n".join(
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _tool_result_blocks_from_content(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return tool_result blocks from an internal user content list."""
+    return [
+        block
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "tool_result" and isinstance(block.get("tool_use_id"), str)
+    ]
+
+
+def _text_blocks_from_content(content: list[dict[str, Any]]) -> list[str]:
+    """Return text block values from an internal user/assistant content list."""
+    return [
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+    ]
 
 
 class AnthropicStreamNormalizer:
@@ -460,6 +561,428 @@ class AnthropicModelProvider:
             content,
             message_id=response.get("id") if isinstance(response.get("id"), str) else None,
         )
+
+
+@dataclass
+class OpenAIChatModelProvider:
+    """OpenAI Chat Completions adapter that preserves the internal message protocol."""
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    max_tokens: int = 4096
+    timeout: float = 120.0
+    transport: Transport | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls) -> "OpenAIChatModelProvider":
+        """Create an OpenAI Chat provider from env-first v0.4 settings."""
+        return cls(
+            base_url=os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com",
+            api_key=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+            model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL"),
+        )
+
+    def __post_init__(self) -> None:
+        """Fill OpenAI Chat defaults without reading secrets into logs."""
+        self.base_url = self.base_url or os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com"
+        self.api_key = self.api_key if self.api_key is not None else os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        self.model = self.model or os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4.1"
+
+    async def stream(
+        self,
+        *,
+        messages: list[dict],
+        system_prompt: list[str],
+        tools: list[object],
+        options: dict,
+    ) -> AsyncIterator[AssistantMessage]:
+        """Produce one normalized assistant message from Chat Completions."""
+        body = await self._build_request_body(messages, system_prompt, tools, options)
+        headers = self._headers()
+        url = _openai_chat_endpoint_from_base_url(self.base_url or "https://api.openai.com")
+        abort_signal = options.get("abortSignal")
+        self.calls.append({"url": url, "body": body, "headers": self._redacted_headers(headers)})
+        _raise_if_aborted(abort_signal)
+        transport = self.transport or _default_openai_transport
+        response = await asyncio.to_thread(transport, url, headers, body, self.timeout)
+        _raise_if_aborted(abort_signal)
+        yield self._response_to_message(response)
+
+    async def _build_request_body(
+        self,
+        messages: list[dict],
+        system_prompt: list[str],
+        tools: list[object],
+        options: dict,
+    ) -> dict[str, Any]:
+        """Map internal messages and tools to Chat Completions wire shape."""
+        model_messages = normalize_messages_for_api(messages)
+        repaired_messages = ensure_tool_result_pairing(model_messages)
+        chat_messages = self._messages_to_chat(repaired_messages, system_prompt)
+        body: dict[str, Any] = {
+            "model": options.get("model") or self.model,
+            "messages": chat_messages,
+            "max_tokens": options.get("max_tokens", self.max_tokens),
+        }
+        tool_specs = [await self._tool_to_chat_spec(tool) for tool in tools]
+        if tool_specs:
+            body["tools"] = tool_specs
+            body["tool_choice"] = "auto"
+        return body
+
+    def _messages_to_chat(self, messages: list[Message], system_prompt: list[str]) -> list[dict[str, Any]]:
+        """Map Anthropic-shaped internal history to OpenAI Chat messages."""
+        output: list[dict[str, Any]] = []
+        if system_prompt:
+            output.append({"role": "system", "content": "\n\n".join(system_prompt)})
+        for message in messages:
+            if message.get("type") == "tombstone":
+                continue
+            payload = message.get("message")
+            if not isinstance(payload, dict):
+                continue
+            role = payload.get("role")
+            content = payload.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, list):
+                continue
+            if role == "user":
+                texts = _text_blocks_from_content(content)
+                if texts:
+                    output.append({"role": "user", "content": "\n".join(texts)})
+                for block in _tool_result_blocks_from_content(content):
+                    output.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            "content": _content_to_text(block.get("content", "")),
+                        }
+                    )
+                continue
+            tool_calls = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_calls.append(
+                        {
+                            "id": str(block.get("id", "")),
+                            "type": "function",
+                            "function": {
+                                "name": str(block.get("name", "")),
+                                "arguments": json.dumps(block.get("input") if isinstance(block.get("input"), dict) else {}, ensure_ascii=False),
+                            },
+                        }
+                    )
+            text = _assistant_text_from_blocks(content)
+            chat_message: dict[str, Any] = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                chat_message["tool_calls"] = tool_calls
+            output.append(chat_message)
+        return output
+
+    async def _tool_to_chat_spec(self, tool: object) -> dict[str, Any]:
+        """Map a kernel Tool to an OpenAI Chat function tool."""
+        spec = await _kernel_tool_to_anthropic_spec(tool)
+        return {
+            "type": "function",
+            "function": {
+                "name": spec["name"],
+                "description": spec.get("description", ""),
+                "parameters": spec.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        }
+
+    def _headers(self) -> dict[str, str]:
+        """Build auth headers from env/config without logging secrets."""
+        if not self.api_key:
+            host = urlparse(self.base_url or "").netloc or "OpenAI-compatible"
+            raise OpenAIAPIError(f"{host} API credentials are missing. Set AGENT_KERNEL_API_KEY or OPENAI_API_KEY.")
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+    def _redacted_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        """Redact credentials in diagnostic call snapshots."""
+        redacted = dict(headers)
+        if "Authorization" in redacted:
+            redacted["Authorization"] = "Bearer [REDACTED]"
+        return redacted
+
+    def _response_to_message(self, response: dict[str, Any]) -> AssistantMessage:
+        """Normalize Chat Completions output to an AssistantMessage."""
+        choices = response.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise OpenAIAPIError("OpenAI Chat response did not include choices.")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        if not isinstance(message, dict):
+            raise OpenAIAPIError("OpenAI Chat response did not include a message.")
+        content_blocks: list[ContentBlock] = []
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            content_blocks.append({"type": "text", "text": content})
+        for tool_call in message.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            content_blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": str(tool_call.get("id") or f"toolu_{uuid4().hex}"),
+                    "name": str(function.get("name") or ""),
+                    "input": _parse_tool_arguments(function.get("arguments"), provider_name="OpenAI Chat"),
+                }
+            )
+        if not content_blocks:
+            content_blocks.append({"type": "text", "text": ""})
+        return create_assistant_message(
+            content_blocks,
+            message_id=response.get("id") if isinstance(response.get("id"), str) else None,
+        )
+
+
+@dataclass
+class OpenAIResponsesModelProvider:
+    """OpenAI Responses adapter that preserves tool_use/tool_result semantics."""
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    max_tokens: int = 4096
+    timeout: float = 120.0
+    transport: Transport | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls) -> "OpenAIResponsesModelProvider":
+        """Create an OpenAI Responses provider from env-first v0.4 settings."""
+        return cls(
+            base_url=os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com",
+            api_key=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+            model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL"),
+        )
+
+    def __post_init__(self) -> None:
+        """Fill Responses defaults without creating global state."""
+        self.base_url = self.base_url or os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com"
+        self.api_key = self.api_key if self.api_key is not None else os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        self.model = self.model or os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4.1"
+
+    async def stream(
+        self,
+        *,
+        messages: list[dict],
+        system_prompt: list[str],
+        tools: list[object],
+        options: dict,
+    ) -> AsyncIterator[AssistantMessage]:
+        """Produce one normalized assistant message from Responses."""
+        body = await self._build_request_body(messages, system_prompt, tools, options)
+        headers = self._headers()
+        url = _openai_responses_endpoint_from_base_url(self.base_url or "https://api.openai.com")
+        abort_signal = options.get("abortSignal")
+        self.calls.append({"url": url, "body": body, "headers": self._redacted_headers(headers)})
+        _raise_if_aborted(abort_signal)
+        transport = self.transport or _default_openai_transport
+        response = await asyncio.to_thread(transport, url, headers, body, self.timeout)
+        _raise_if_aborted(abort_signal)
+        yield self._response_to_message(response)
+
+    async def _build_request_body(
+        self,
+        messages: list[dict],
+        system_prompt: list[str],
+        tools: list[object],
+        options: dict,
+    ) -> dict[str, Any]:
+        """Map internal messages and tools to Responses wire shape."""
+        model_messages = normalize_messages_for_api(messages)
+        repaired_messages = ensure_tool_result_pairing(model_messages)
+        body: dict[str, Any] = {
+            "model": options.get("model") or self.model,
+            "input": self._messages_to_responses_input(repaired_messages),
+            "max_output_tokens": options.get("max_tokens", self.max_tokens),
+        }
+        if system_prompt:
+            body["instructions"] = "\n\n".join(system_prompt)
+        tool_specs = [await self._tool_to_responses_spec(tool) for tool in tools]
+        if tool_specs:
+            body["tools"] = tool_specs
+            body["tool_choice"] = "auto"
+        return body
+
+    def _messages_to_responses_input(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Map Anthropic-shaped internal history to Responses input items."""
+        output: list[dict[str, Any]] = []
+        for message in messages:
+            if message.get("type") == "tombstone":
+                continue
+            payload = message.get("message")
+            if not isinstance(payload, dict):
+                continue
+            role = payload.get("role")
+            content = payload.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, list):
+                continue
+            if role == "user":
+                texts = _text_blocks_from_content(content)
+                if texts:
+                    output.append({"role": "user", "content": "\n".join(texts)})
+                for block in _tool_result_blocks_from_content(content):
+                    output.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": block["tool_use_id"],
+                            "output": _content_to_text(block.get("content", "")),
+                        }
+                    )
+                continue
+            text = _assistant_text_from_blocks(content)
+            if text:
+                output.append({"role": "assistant", "content": text})
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    output.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(block.get("id", "")),
+                            "name": str(block.get("name", "")),
+                            "arguments": json.dumps(block.get("input") if isinstance(block.get("input"), dict) else {}, ensure_ascii=False),
+                        }
+                    )
+        return output
+
+    async def _tool_to_responses_spec(self, tool: object) -> dict[str, Any]:
+        """Map a kernel Tool to an OpenAI Responses function tool."""
+        spec = await _kernel_tool_to_anthropic_spec(tool)
+        return {
+            "type": "function",
+            "name": spec["name"],
+            "description": spec.get("description", ""),
+            "parameters": spec.get("input_schema") or {"type": "object", "properties": {}},
+            "strict": False,
+        }
+
+    def _headers(self) -> dict[str, str]:
+        """Build auth headers from env/config without logging secrets."""
+        if not self.api_key:
+            host = urlparse(self.base_url or "").netloc or "OpenAI-compatible"
+            raise OpenAIAPIError(f"{host} API credentials are missing. Set AGENT_KERNEL_API_KEY or OPENAI_API_KEY.")
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+    def _redacted_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        """Redact credentials in diagnostic call snapshots."""
+        redacted = dict(headers)
+        if "Authorization" in redacted:
+            redacted["Authorization"] = "Bearer [REDACTED]"
+        return redacted
+
+    def _response_to_message(self, response: dict[str, Any]) -> AssistantMessage:
+        """Normalize Responses output items to an AssistantMessage."""
+        output = response.get("output")
+        if not isinstance(output, list):
+            raise OpenAIAPIError("OpenAI Responses response did not include output items.")
+        content_blocks: list[ContentBlock] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type == "message":
+                for block in item.get("content") or []:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        content_blocks.append({"type": "text", "text": block["text"]})
+            elif item_type == "output_text" and isinstance(item.get("text"), str):
+                content_blocks.append({"type": "text", "text": item["text"]})
+            elif item_type == "function_call":
+                content_blocks.append(
+                    {
+                        "type": "tool_use",
+                        "id": str(item.get("call_id") or item.get("id") or f"toolu_{uuid4().hex}"),
+                        "name": str(item.get("name") or ""),
+                        "input": _parse_tool_arguments(item.get("arguments"), provider_name="OpenAI Responses"),
+                    }
+                )
+        if not content_blocks:
+            output_text = response.get("output_text")
+            if isinstance(output_text, str):
+                content_blocks.append({"type": "text", "text": output_text})
+        if not content_blocks:
+            content_blocks.append({"type": "text", "text": ""})
+        return create_assistant_message(
+            content_blocks,
+            message_id=response.get("id") if isinstance(response.get("id"), str) else None,
+        )
+
+
+async def _kernel_tool_to_anthropic_spec(tool: object) -> dict[str, Any]:
+    """Build the kernel's canonical tool spec before provider-specific mapping."""
+    if hasattr(tool, "to_api_spec"):
+        return await _maybe_await(tool.to_api_spec())
+    properties = {
+        field_name: _json_schema_for_type(field_type)
+        for field_name, field_type in getattr(tool, "input_schema", {}).items()
+    }
+    description_parts = []
+    if hasattr(tool, "description"):
+        description_parts.append(await tool.description(None))
+    if hasattr(tool, "prompt"):
+        description_parts.append(await tool.prompt())
+    description = "\n\n".join(part for part in description_parts if part)
+    return {
+        "name": getattr(tool, "name"),
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": list(getattr(tool, "required_fields", ())),
+            "additionalProperties": False,
+        },
+    }
+
+
+def build_model_provider_from_env(*, require_credentials: bool = False) -> ModelProvider:
+    """Build the v0.4 env-first model provider without changing the query loop."""
+    provider_name = (os.environ.get("AGENT_KERNEL_PROVIDER") or "anthropic").strip().lower()
+    if provider_name in {"anthropic", "anthropic-compatible"}:
+        has_credentials = bool(
+            os.environ.get("AGENT_KERNEL_API_KEY")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
+        if require_credentials and not has_credentials:
+            raise AnthropicAPIError(
+                "Anthropic-compatible API credentials are missing. Set AGENT_KERNEL_API_KEY, "
+                "ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_API_KEY."
+            )
+        if not has_credentials and not require_credentials:
+            return FakeModelProvider()
+        return AnthropicModelProvider(
+            base_url=os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("ANTHROPIC_BASE_URL"),
+            auth_token=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"),
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+            model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("ANTHROPIC_MODEL"),
+        )
+    if provider_name == "openai-chat":
+        has_credentials = bool(os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+        if require_credentials and not has_credentials:
+            raise OpenAIAPIError("OpenAI Chat API credentials are missing. Set AGENT_KERNEL_API_KEY or OPENAI_API_KEY.")
+        if not has_credentials and not require_credentials:
+            return FakeModelProvider()
+        return OpenAIChatModelProvider.from_env()
+    if provider_name in {"openai-responses", "openai-response"}:
+        has_credentials = bool(os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+        if require_credentials and not has_credentials:
+            raise OpenAIAPIError("OpenAI Responses API credentials are missing. Set AGENT_KERNEL_API_KEY or OPENAI_API_KEY.")
+        if not has_credentials and not require_credentials:
+            return FakeModelProvider()
+        return OpenAIResponsesModelProvider.from_env()
+    raise OpenAIAPIError(
+        f"Unsupported AGENT_KERNEL_PROVIDER '{provider_name}'. "
+        "Use anthropic, openai-chat, or openai-responses."
+    )
 
 
 @dataclass

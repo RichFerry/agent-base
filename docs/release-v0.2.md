@@ -4,7 +4,7 @@ This document closes the v0.2 local runner and capability hardening phase for th
 
 ## Release Summary
 
-v0.2 does not attempt to build a full Claude Code product shell. It adds a minimal, testable local runner layer around the existing kernel so the current Python port can verify end-to-end capability flow through `QueryEngine.submit_message()`.
+v0.2 does not attempt to build a full product shell. It adds a minimal, testable local runner layer around the existing kernel so the current Python port can verify end-to-end capability flow through `QueryEngine.submit_message()`.
 
 ### Local Runner
 

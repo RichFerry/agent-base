@@ -31,6 +31,18 @@ export ANTHROPIC_BASE_URL="https://api.example.com/anthropic"
 
 `ANTHROPIC_API_KEY` is also supported when `ANTHROPIC_AUTH_TOKEN` is not set.
 
+v0.4 also supports environment-first provider selection for manual smokes:
+
+```bash
+export AGENT_KERNEL_PROVIDER="anthropic"        # or openai-chat / openai-responses
+export AGENT_KERNEL_API_KEY="..."
+export AGENT_KERNEL_MODEL="..."
+export AGENT_KERNEL_BASE_URL="..."
+```
+
+For OpenAI-compatible modes, `OPENAI_API_KEY`, `OPENAI_MODEL`, and
+`OPENAI_BASE_URL` are also supported as fallbacks.
+
 If Python reports a local certificate verification error, point OpenSSL at a local CA bundle instead of disabling TLS verification:
 
 ```bash
@@ -319,6 +331,18 @@ python3 -m pytest tests/test_real_mcp_smoke.py -q
 ```
 
 The smoke uses a fake model to force the MCP `tool_use`; it validates the real stdio process and the kernel MCP `tool_result` path without a real model call.
+
+v0.4 also supports local runner MCP stdio config loading:
+
+```bash
+agent-kernel-local \
+  --mcp-config examples/mcp/stdio-config.json \
+  --permission-mode bypass \
+  "Call the stdio echo MCP tool with hello."
+```
+
+This still starts only local stdio processes that you explicitly configure. It
+does not enable remote MCP, OAuth, SSE, or default third-party server startup.
 
 ### Real Runner E2E Smoke
 

@@ -14,7 +14,7 @@ import pytest
 
 from agent_kernel.config import ContextCompactionConfig, KernelConfig
 from agent_kernel.messages import create_attachment_message, create_assistant_message, create_tool_result_message, create_user_message
-from agent_kernel.model_provider import AnthropicAPIError, AnthropicModelProvider, FakeModelProvider
+from agent_kernel.model_provider import AnthropicAPIError, AnthropicModelProvider, FakeModelProvider, OpenAIAPIError, OpenAIChatModelProvider, OpenAIResponsesModelProvider, build_model_provider_from_env
 from agent_kernel.permissions import PermissionDecision, ToolPermissionContext, has_permissions_to_use_tool
 from agent_kernel.query_engine import QueryEngine
 from agent_kernel.tools import AppState, BashTool, EditTool, FileReadTool, FileWriteTool, ReadFileStateEntry, Tool, ToolResult, ToolUseContext, WebFetchTool, WebSearchTool
@@ -1824,6 +1824,283 @@ def test_anthropic_provider_uses_x_api_key_when_no_auth_token() -> None:
     assert captured["headers"]["x-api-key"] == "api-key"
     assert "Authorization" not in captured["headers"]
     assert response[0]["message"]["content"][0]["text"] == "ok"
+
+
+def test_openai_chat_provider_builds_request_and_parses_tool_calls() -> None:
+    """OpenAI Chat provider maps kernel tools/history without changing the loop protocol."""
+    captured = {}
+
+    def transport(url, headers, body, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = body
+        captured["timeout"] = timeout
+        return {
+            "id": "chatcmpl_1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_read",
+                                "type": "function",
+                                "function": {
+                                    "name": "Read",
+                                    "arguments": json.dumps({"file_path": "/tmp/example.txt"}),
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+
+    provider = OpenAIChatModelProvider(
+        base_url="https://api.openai.example",
+        api_key="openai-secret",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    response = asyncio.run(
+        _collect(
+            provider.stream(
+                messages=[create_user_message("hello")],
+                system_prompt=["sys"],
+                tools=[FileReadTool()],
+                options={},
+            )
+        )
+    )
+
+    assert captured["url"] == "https://api.openai.example/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer openai-secret"
+    assert captured["body"]["messages"][0] == {"role": "system", "content": "sys"}
+    assert captured["body"]["messages"][1] == {"role": "user", "content": "hello"}
+    assert captured["body"]["tools"][0]["type"] == "function"
+    assert captured["body"]["tools"][0]["function"]["name"] == "Read"
+    assert "file_path" in captured["body"]["tools"][0]["function"]["parameters"]["required"]
+    assert provider.calls[0]["headers"]["Authorization"] == "Bearer [REDACTED]"
+    assert response[0]["message"]["id"] == "chatcmpl_1"
+    assert response[0]["message"]["content"][0] == {
+        "type": "tool_use",
+        "id": "call_read",
+        "name": "Read",
+        "input": {"file_path": "/tmp/example.txt"},
+    }
+
+
+def test_openai_chat_provider_maps_tool_results_to_tool_messages() -> None:
+    """Chat provider preserves tool_result pairing by emitting role=tool messages."""
+    captured = {}
+
+    def transport(url, headers, body, timeout):
+        captured["body"] = body
+        return {"id": "chatcmpl_2", "choices": [{"message": {"role": "assistant", "content": "done"}}]}
+
+    assistant = create_assistant_message(
+        [{"type": "tool_use", "id": "call_read", "name": "Read", "input": {"file_path": "/tmp/a"}}]
+    )
+    provider = OpenAIChatModelProvider(api_key="openai-secret", transport=transport)
+
+    asyncio.run(
+        _collect(
+            provider.stream(
+                messages=[
+                    create_user_message("read"),
+                    assistant,
+                    create_tool_result_message({"type": "tool_result", "tool_use_id": "call_read", "content": "file text"}),
+                ],
+                system_prompt=[],
+                tools=[],
+                options={},
+            )
+        )
+    )
+
+    assert captured["body"]["messages"][0]["role"] == "user"
+    assert captured["body"]["messages"][1]["role"] == "assistant"
+    assert captured["body"]["messages"][1]["tool_calls"][0]["id"] == "call_read"
+    assert captured["body"]["messages"][2] == {"role": "tool", "tool_call_id": "call_read", "content": "file text"}
+
+
+def test_openai_chat_provider_accepts_dict_tool_arguments() -> None:
+    """Some compatible providers return already-decoded tool arguments."""
+    def transport(url, headers, body, timeout):
+        return {
+            "id": "chatcmpl_dict_args",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_read_dict",
+                                "type": "function",
+                                "function": {
+                                    "name": "Read",
+                                    "arguments": {"file_path": "/tmp/dict.txt"},
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+
+    provider = OpenAIChatModelProvider(api_key="openai-secret", transport=transport)
+
+    response = asyncio.run(_collect(provider.stream(messages=[], system_prompt=[], tools=[], options={})))
+
+    assert response[0]["message"]["content"][0] == {
+        "type": "tool_use",
+        "id": "call_read_dict",
+        "name": "Read",
+        "input": {"file_path": "/tmp/dict.txt"},
+    }
+
+
+def test_openai_responses_provider_builds_request_and_parses_function_call() -> None:
+    """OpenAI Responses provider maps function_call items back to tool_use blocks."""
+    captured = {}
+
+    def transport(url, headers, body, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["body"] = body
+        return {
+            "id": "resp_1",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_search",
+                    "name": "WebSearch",
+                    "arguments": json.dumps({"query": "agent kernel"}),
+                }
+            ],
+        }
+
+    provider = OpenAIResponsesModelProvider(
+        base_url="https://api.openai.example/v1",
+        api_key="openai-secret",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    response = asyncio.run(
+        _collect(
+            provider.stream(
+                messages=[create_user_message("search")],
+                system_prompt=["sys"],
+                tools=[WebSearchTool()],
+                options={},
+            )
+        )
+    )
+
+    assert captured["url"] == "https://api.openai.example/v1/responses"
+    assert captured["headers"]["Authorization"] == "Bearer openai-secret"
+    assert captured["body"]["instructions"] == "sys"
+    assert captured["body"]["input"] == [{"role": "user", "content": "search"}]
+    assert captured["body"]["tools"][0]["type"] == "function"
+    assert captured["body"]["tools"][0]["name"] == "WebSearch"
+    assert captured["body"]["tools"][0]["strict"] is False
+    assert provider.calls[0]["headers"]["Authorization"] == "Bearer [REDACTED]"
+    assert response[0]["message"]["id"] == "resp_1"
+    assert response[0]["message"]["content"][0] == {
+        "type": "tool_use",
+        "id": "call_search",
+        "name": "WebSearch",
+        "input": {"query": "agent kernel"},
+    }
+
+
+def test_openai_responses_provider_maps_tool_results_to_function_outputs() -> None:
+    """Responses provider preserves existing tool_result ids as function_call_output call ids."""
+    captured = {}
+
+    def transport(url, headers, body, timeout):
+        captured["body"] = body
+        return {
+            "id": "resp_2",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }
+            ],
+        }
+
+    assistant = create_assistant_message(
+        [{"type": "tool_use", "id": "call_read", "name": "Read", "input": {"file_path": "/tmp/a"}}]
+    )
+    provider = OpenAIResponsesModelProvider(api_key="openai-secret", transport=transport)
+
+    response = asyncio.run(
+        _collect(
+            provider.stream(
+                messages=[
+                    create_user_message("read"),
+                    assistant,
+                    create_tool_result_message({"type": "tool_result", "tool_use_id": "call_read", "content": "file text"}),
+                ],
+                system_prompt=[],
+                tools=[],
+                options={},
+            )
+        )
+    )
+
+    assert captured["body"]["input"][0] == {"role": "user", "content": "read"}
+    assert captured["body"]["input"][1]["type"] == "function_call"
+    assert captured["body"]["input"][1]["call_id"] == "call_read"
+    assert captured["body"]["input"][2] == {"type": "function_call_output", "call_id": "call_read", "output": "file text"}
+    assert response[0]["message"]["content"][0] == {"type": "text", "text": "done"}
+
+
+def test_openai_provider_rejects_invalid_tool_argument_json() -> None:
+    """Invalid provider tool JSON fails clearly before it can corrupt transcript state."""
+    def transport(url, headers, body, timeout):
+        return {
+            "id": "chatcmpl_bad",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_bad",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{bad-json"},
+                            }
+                        ],
+                    }
+                }
+            ],
+        }
+
+    provider = OpenAIChatModelProvider(api_key="openai-secret", transport=transport)
+
+    with pytest.raises(OpenAIAPIError, match="invalid tool arguments JSON"):
+        asyncio.run(_collect(provider.stream(messages=[], system_prompt=[], tools=[], options={})))
+
+
+def test_build_model_provider_from_env_selects_openai_without_leaking_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env-first provider selection supports OpenAI without storing real credentials."""
+    monkeypatch.setenv("AGENT_KERNEL_PROVIDER", "openai-chat")
+    monkeypatch.setenv("AGENT_KERNEL_API_KEY", "secret-openai-key")
+    monkeypatch.setenv("AGENT_KERNEL_MODEL", "gpt-test")
+
+    provider = build_model_provider_from_env(require_credentials=True)
+
+    assert isinstance(provider, OpenAIChatModelProvider)
+    assert provider.model == "gpt-test"
+    assert provider.api_key == "secret-openai-key"
 
 
 async def _collect(aiter):

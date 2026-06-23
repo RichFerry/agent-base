@@ -28,7 +28,7 @@ from .agents import AGENT_TOOL_NAME, AgentDefinition, AgentTool, load_agents
 from .config import KernelConfig
 from .memory import MemoryLoader
 from .messages import Message, create_user_message
-from .model_provider import AnthropicModelProvider, FakeModelProvider, ModelProvider
+from .model_provider import ModelProvider, build_model_provider_from_env
 from .mcp import mcp_tools_from_clients
 from .prompt_composer import PromptComposer
 from .query import QueryParams, query
@@ -109,11 +109,7 @@ class QueryEngine:
     def __post_init__(self) -> None:
         """解析所有可插拔组件，并创建本 session 的 ToolUseContext。"""
         if self.model_provider is None:
-            self.model_provider = (
-                AnthropicModelProvider.from_env()
-                if os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
-                else FakeModelProvider()
-            )
+            self.model_provider = build_model_provider_from_env()
         # 以下组件共享同一 KernelConfig 和 session_id，保证路径及扩展视图一致。
         self.memory_loader = MemoryLoader(self.config)
         self.prompt_composer = PromptComposer(self.config, self.memory_loader)

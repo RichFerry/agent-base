@@ -156,14 +156,17 @@ def _extract_description(markdown: str, fallback: str) -> str:
 
 def _skill_search_dirs(config: KernelConfig) -> list[Path]:
     """完成 ``_skill_search_dirs`` 对应的skill 扩展内部步骤。"""
-    if getattr(config, "_agent_kernel_skill_paths_only", False):
+    discovery_mode = getattr(config, "skill_discovery_mode", "ambient")
+    if discovery_mode == "explicit":
         dirs = [Path(path) for path in config.skill_paths]
-    else:
+    elif discovery_mode == "ambient":
         dirs = [
             Path(config.cwd) / ".claude" / "skills",
             Path(config.config_home) / "skills",
             *[Path(path) for path in config.skill_paths],
         ]
+    else:
+        raise ValueError("skill_discovery_mode must be 'ambient' or 'explicit'.")
     result: list[Path] = []
     seen: set[Path] = set()
     for directory in dirs:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import subprocess
 from urllib.error import HTTPError, URLError
@@ -37,11 +38,15 @@ from examples.local_agent import (
     build_web_search_handler_from_env,
     discover_local_skills,
     format_web_search_unavailable_message,
+    latest_local_session_id,
+    list_local_sessions,
     load_mcp_fixture,
     main,
     make_http_web_fetch_handler,
     make_stub_web_search_handler,
+    read_memory_file,
     run_local_agent_once,
+    write_memory_file,
 )
 from agent_kernel.skills import SkillTool
 
@@ -726,8 +731,37 @@ Echo the arguments exactly: $ARGUMENTS
     assert [skill.name for skill in discover_local_skills(skills_root)] == ["echo"]
     assert engine.skills[0].name == "echo"
     assert engine.skills[0].base_dir == skill_path.parent
+    assert engine.config.skill_discovery_mode == "explicit"
     assert any(isinstance(tool, SkillTool) for tool in engine.tools)
     assert engine.tool_use_context.app_state.tool_permission_context.mode == "ask"
+
+
+def test_discover_local_skills_reports_duplicate_names(tmp_path: Path) -> None:
+    """Duplicate local skill names fail before they can collide in the registry."""
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "first",
+        """---
+name: echo
+description: First echo
+---
+Echo first.
+""",
+    )
+    _write_skill(
+        skills_root,
+        "second",
+        """---
+name: echo
+description: Second echo
+---
+Echo second.
+""",
+    )
+
+    with pytest.raises(SkillsConfigurationError, match="Duplicate skill name 'echo'"):
+        discover_local_skills(skills_root)
 
 
 def test_build_local_engine_loads_mcp_fixture(tmp_path: Path) -> None:
@@ -782,6 +816,159 @@ def test_cli_skills_dir_missing_returns_clear_error(capsys: pytest.CaptureFixtur
     assert exit_code == 2
     assert "Skills directory does not exist" in captured.err
     assert captured.out == ""
+
+
+def test_cli_list_skills_does_not_require_model_credentials(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """--list-skills inspects local skills and exits before provider setup."""
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "echo",
+        """---
+name: echo
+description: Echo text locally
+---
+Echo the arguments exactly.
+""",
+    )
+
+    exit_code = main(["--skills-dir", str(skills_root), "--list-skills"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "echo\tEcho text locally" in captured.out
+    assert captured.err == ""
+
+
+def test_cli_list_skills_without_dir_is_deterministic(capsys: pytest.CaptureFixture[str]) -> None:
+    """Without --skills-dir, --list-skills reports that no explicit skills are loaded."""
+    exit_code = main(["--list-skills"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "No skills loaded. Pass --skills-dir PATH" in captured.out
+    assert captured.err == ""
+
+
+def test_list_sessions_and_continue_are_deterministic(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """Session listing is read-only and --continue can target the latest transcript."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    first = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["first"]),
+        session_id="session-a",
+        require_api_key=False,
+    )
+    second = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["second"]),
+        session_id="session-b",
+        require_api_key=False,
+    )
+    asyncio.run(run_local_agent_once("first prompt", engine=first))
+    asyncio.run(run_local_agent_once("second prompt", engine=second))
+    os.utime(first.session_store.transcript_path, (1, 1))
+    os.utime(second.session_store.transcript_path, (2, 2))
+
+    assert list_local_sessions(repo, config_home) == ["session-a", "session-b"]
+    assert latest_local_session_id(repo, config_home) == "session-b"
+
+    exit_code = main(["--cwd", str(repo), "--config-home", str(config_home), "--list-sessions"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.out.splitlines() == ["session-a", "session-b"]
+    assert captured.err == ""
+
+
+def test_build_local_engine_resume_loads_existing_transcript(tmp_path: Path) -> None:
+    """Runner resume flag uses the existing QueryEngine transcript restore path."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    first = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["first response"]),
+        session_id="resume-cli",
+        require_api_key=False,
+    )
+    asyncio.run(run_local_agent_once("first prompt", engine=first))
+
+    resumed = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["second response"]),
+        session_id="resume-cli",
+        resume=True,
+        require_api_key=False,
+    )
+    assert [message["type"] for message in resumed.mutable_messages] == ["user", "assistant"]
+
+    result = asyncio.run(run_local_agent_once("second prompt", engine=resumed))
+    rows = [json.loads(line) for line in result.transcript_path.read_text(encoding="utf-8").splitlines()]
+
+    assert [row["type"] for row in rows] == ["user", "assistant", "user", "assistant"]
+    assert rows[0]["sessionId"] == "resume-cli"
+    assert rows[-1]["sessionId"] == "resume-cli"
+
+
+def test_memory_cli_read_write_status_and_path_safety(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Memory commands are explicit, local, and confined to the project memory dir."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+
+    status_code = main(["--cwd", str(repo), "--config-home", str(config_home), "--memory-status"])
+    status = capsys.readouterr()
+    assert status_code == 0
+    assert "memory_dir=" in status.out
+    assert "entrypoint_exists=false" in status.out
+
+    write_code = main(
+        [
+            "--cwd",
+            str(repo),
+            "--config-home",
+            str(config_home),
+            "--memory-write",
+            "notes/preference.md",
+            "--memory-text",
+            "Use concise answers.",
+        ]
+    )
+    written = capsys.readouterr()
+    assert write_code == 0
+    assert "wrote " in written.out
+
+    assert read_memory_file("notes/preference.md", cwd=repo, config_home=config_home) == "Use concise answers."
+    target = write_memory_file("MEMORY.md", "- [Preference](notes/preference.md) - concise\n", cwd=repo, config_home=config_home)
+    assert target.name == "MEMORY.md"
+
+    read_code = main(["--cwd", str(repo), "--config-home", str(config_home), "--memory-read"])
+    read = capsys.readouterr()
+    assert read_code == 0
+    assert "- [Preference](notes/preference.md)" in read.out
+
+    unsafe_code = main(
+        [
+            "--cwd",
+            str(repo),
+            "--config-home",
+            str(config_home),
+            "--memory-write",
+            "../escape.md",
+            "--memory-text",
+            "nope",
+        ]
+    )
+    unsafe = capsys.readouterr()
+    assert unsafe_code == 2
+    assert "Memory path must stay inside the project memory directory" in unsafe.err
 
 
 def test_build_local_engine_mcp_fixture_errors_are_clear(tmp_path: Path) -> None:
@@ -1181,6 +1368,7 @@ def test_permission_deny_is_logged_and_transcript_remains_valid(tmp_path: Path) 
 
 def test_missing_api_key_error_is_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Real-provider runner mode fails early with a readable credentials message."""
+    monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
@@ -1188,8 +1376,30 @@ def test_missing_api_key_error_is_clear(tmp_path: Path, monkeypatch: pytest.Monk
         build_local_engine(cwd=_repo(tmp_path), config_home=tmp_path / ".claude")
 
 
+def test_missing_api_key_does_not_start_mcp_config_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Credential failure happens before local stdio MCP config loading can start a process."""
+    monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    config_path = tmp_path / "mcp.json"
+    config_path.write_text(json.dumps({"mcpServers": {"echo": {"command": "python3", "args": ["server.py"]}}}), encoding="utf-8")
+    calls: list[Path] = []
+
+    def fail_if_called(path, *, cwd=None):
+        calls.append(Path(path))
+        raise AssertionError("MCP config loader should not run without model credentials")
+
+    monkeypatch.setattr(local_agent, "load_mcp_config", fail_if_called)
+
+    with pytest.raises(MissingCredentialsError):
+        build_local_engine(cwd=_repo(tmp_path), config_home=tmp_path / ".claude", mcp_config=config_path)
+
+    assert calls == []
+
+
 def test_cli_missing_api_key_returns_error_status(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """The script entry point reports missing credentials without a traceback."""
+    monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 

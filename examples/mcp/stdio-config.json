@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "stdio-echo": {
+      "type": "stdio",
+      "description": "Local-only stdio MCP echo server for offline tests.",
+      "command": "python3",
+      "args": ["examples/mcp/stdio_echo_server.py"]
+    }
+  }
+}

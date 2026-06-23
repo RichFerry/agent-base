@@ -86,6 +86,44 @@ Use the repository state to create a commit.
     assert skills[0].base_dir == skill_path.parent
 
 
+def test_skill_discovery_mode_explicit_skips_ambient_dirs(tmp_path: Path) -> None:
+    """显式 discovery mode 只加载 skill_paths，不读取 cwd/config_home 的 ambient skills。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    ambient_dir = repo / ".claude" / "skills" / "ambient"
+    ambient_dir.mkdir(parents=True)
+    (ambient_dir / "SKILL.md").write_text(
+        """---
+description: Ambient skill
+---
+Do not load in explicit mode.
+""",
+        encoding="utf-8",
+    )
+    explicit_root = tmp_path / "explicit-skills"
+    explicit_dir = explicit_root / "explicit"
+    explicit_dir.mkdir(parents=True)
+    (explicit_dir / "SKILL.md").write_text(
+        """---
+description: Explicit skill
+---
+Load only this skill.
+""",
+        encoding="utf-8",
+    )
+    config = KernelConfig(
+        cwd=repo,
+        config_home=tmp_path / ".claude",
+        skill_paths=(explicit_root,),
+        skill_discovery_mode="explicit",
+        session_start_date="2026-06-14",
+    )
+
+    skills = load_skills(config)
+
+    assert [skill.name for skill in skills] == ["explicit"]
+
+
 def test_query_engine_registers_skill_tool_prompt_and_sdk_init(tmp_path: Path) -> None:
     """验证 ``query engine registers skill tool prompt and sdk init`` 场景的行为、消息形状和关键不变量。"""
     config = _make_config(tmp_path)

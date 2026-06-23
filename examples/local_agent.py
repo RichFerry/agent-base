@@ -13,47 +13,45 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import socket
 import sys
-import time
 from typing import Any, Callable, Mapping, Sequence
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agent_kernel import AnthropicModelProvider, KernelConfig, MCPClientConfig, ModelProvider, QueryEngine
+from agent_kernel import KernelConfig, MCPClientConfig, ModelProvider, QueryEngine, SessionStore, build_model_provider_from_env
+from agent_kernel.memory import ENTRYPOINT_NAME, MemoryLoader
+from agent_kernel.mcp import MCP_CONFIG_ENV, MCPConfigurationError, close_mcp_clients, load_mcp_config
 from agent_kernel.skills import SkillDefinition, skill_from_markdown
+import agent_kernel.web_adapters as _web_adapters
+from agent_kernel.web_adapters import (
+    WEB_FETCH_MAX_BYTES_ENV,
+    WEB_FETCH_MAX_CHARS_ENV,
+    WEB_FETCH_PROVIDER_ENV,
+    WEB_FETCH_TIMEOUT_ENV,
+    WEB_SEARCH_API_KEY_ENV,
+    WEB_SEARCH_MODEL_ENV,
+    WEB_SEARCH_PROVIDER_ENV,
+    WEB_SEARCH_STUB_RESULTS_ENV,
+    WEB_SEARCH_TIMEOUT_ENV,
+    WEB_SEARCH_URL_ENV,
+    WebFetchConfigurationError,
+    WebFetchHandler,
+    WebSearchConfigurationError,
+    WebSearchHandler,
+    format_web_fetch_unavailable_message,
+    format_web_search_unavailable_message,
+)
 
 
 EventLogger = Callable[[str], None]
-WebSearchHandler = Callable[[dict[str, Any]], Any]
-WebFetchHandler = Callable[[str], Any]
-WEB_SEARCH_PROVIDER_ENV = "AGENT_KERNEL_WEB_SEARCH_PROVIDER"
-WEB_SEARCH_STUB_RESULTS_ENV = "AGENT_KERNEL_WEB_SEARCH_STUB_RESULTS"
-WEB_SEARCH_URL_ENV = "AGENT_KERNEL_WEB_SEARCH_URL"
-WEB_SEARCH_API_KEY_ENV = "AGENT_KERNEL_WEB_SEARCH_API_KEY"
-WEB_SEARCH_MODEL_ENV = "AGENT_KERNEL_WEB_SEARCH_MODEL"
-WEB_SEARCH_TIMEOUT_ENV = "AGENT_KERNEL_WEB_SEARCH_TIMEOUT"
-WEB_FETCH_PROVIDER_ENV = "AGENT_KERNEL_WEB_FETCH_PROVIDER"
-WEB_FETCH_TIMEOUT_ENV = "AGENT_KERNEL_WEB_FETCH_TIMEOUT"
-WEB_FETCH_MAX_BYTES_ENV = "AGENT_KERNEL_WEB_FETCH_MAX_BYTES"
-WEB_FETCH_MAX_CHARS_ENV = "AGENT_KERNEL_WEB_FETCH_MAX_CHARS"
+# Compatibility shim for existing tests that monkeypatch examples.local_agent.urlopen.
+urlopen = _web_adapters.urlopen
 
 
 class MissingCredentialsError(RuntimeError):
     """Raised when the real local runner has no model API credentials."""
-
-
-class WebSearchConfigurationError(RuntimeError):
-    """Raised when the example runner cannot configure WebSearch."""
-
-
-class WebFetchConfigurationError(RuntimeError):
-    """Raised when the example runner cannot configure WebFetch."""
 
 
 class SkillsConfigurationError(RuntimeError):
@@ -62,6 +60,10 @@ class SkillsConfigurationError(RuntimeError):
 
 class MCPFixtureConfigurationError(RuntimeError):
     """Raised when the example runner cannot configure a local MCP fixture."""
+
+
+class MemoryConfigurationError(RuntimeError):
+    """Raised when the example runner cannot safely access local memory files."""
 
 
 @dataclass
@@ -76,369 +78,45 @@ class LocalAgentRun:
 
 
 def has_api_credentials(env: Mapping[str, str] | None = None) -> bool:
-    """Return whether Anthropic-compatible credentials are present."""
+    """Return whether credentials are present for the selected model provider."""
     values = env or os.environ
-    return bool(values.get("ANTHROPIC_AUTH_TOKEN") or values.get("ANTHROPIC_API_KEY"))
+    provider = (values.get("AGENT_KERNEL_PROVIDER") or "anthropic").strip().lower()
+    if provider in {"openai-chat", "openai-responses", "openai-response"}:
+        return bool(values.get("AGENT_KERNEL_API_KEY") or values.get("OPENAI_API_KEY"))
+    return bool(values.get("AGENT_KERNEL_API_KEY") or values.get("ANTHROPIC_AUTH_TOKEN") or values.get("ANTHROPIC_API_KEY"))
 
 
-def format_web_search_unavailable_message() -> str:
-    """Return the shared example-layer message for missing WebSearch setup."""
-    return "WebSearch is not configured. Provide a web_search_handler or configure the local runner search provider."
+def _sync_web_adapter_urlopen() -> None:
+    """Keep legacy local_agent.urlopen monkeypatches wired to web adapters."""
+    _web_adapters.urlopen = urlopen
 
 
-def format_web_fetch_unavailable_message() -> str:
-    """Return the shared example-layer message for missing WebFetch setup."""
-    return "WebFetch is not configured. Set AGENT_KERNEL_WEB_FETCH_PROVIDER=http or provide a web_fetch_handler."
+def build_web_search_handler_from_env(env: Mapping[str, str] | None = None) -> WebSearchHandler | None:
+    """Compatibility wrapper around the internal WebSearch adapter builder."""
+    _sync_web_adapter_urlopen()
+    handler = _web_adapters.build_web_search_handler_from_env(env)
+    if handler is None:
+        return None
+
+    def wrapped(args: dict[str, Any]) -> Any:
+        _sync_web_adapter_urlopen()
+        return handler(args)
+
+    return wrapped
 
 
-def _load_stub_results(path: str | Path) -> Any:
-    try:
-        return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise WebSearchConfigurationError(f"Unable to read WebSearch stub results file: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise WebSearchConfigurationError(f"WebSearch stub results file is not valid JSON: {exc}") from exc
+def build_web_fetch_handler_from_env(env: Mapping[str, str] | None = None) -> WebFetchHandler | None:
+    """Compatibility wrapper around the internal WebFetch adapter builder."""
+    _sync_web_adapter_urlopen()
+    handler = _web_adapters.build_web_fetch_handler_from_env(env)
+    if handler is None:
+        return None
 
+    def wrapped(url: str) -> Any:
+        _sync_web_adapter_urlopen()
+        return handler(url)
 
-def make_stub_web_search_handler(results: Any | None = None) -> WebSearchHandler:
-    """Build a deterministic, no-network WebSearch handler for local examples/tests."""
-    configured_results = results
-
-    def handler(args: dict[str, Any]) -> dict[str, Any]:
-        query = str(args.get("query") or "")
-        if configured_results is None:
-            content = [
-                {
-                    "title": f"Stub search result for {query}",
-                    "url": "https://example.invalid/search",
-                    "snippet": "Configure a real example adapter to return live search results.",
-                }
-            ]
-            return {"query": query, "results": [{"content": content}]}
-        if isinstance(configured_results, dict):
-            output = dict(configured_results)
-            output.setdefault("query", query)
-            return output
-        return configured_results
-
-    return handler
-
-
-def _normalise_http_json_result_item(item: Any) -> dict[str, str]:
-    if not isinstance(item, dict):
-        text = str(item)
-        return {"title": text, "url": "", "snippet": text}
-    title = item.get("title") or item.get("name") or item.get("url") or item.get("link") or item.get("snippet") or "Result"
-    url = item.get("url") or item.get("link") or item.get("href") or ""
-    snippet = item.get("snippet") or item.get("description") or item.get("content") or item.get("summary") or item.get("text") or ""
-    output = {"title": str(title), "url": str(url)}
-    if snippet:
-        output["snippet"] = str(snippet)
-    return output
-
-
-def _normalise_http_json_result_list(items: Any, query: str) -> dict[str, Any]:
-    if not isinstance(items, list):
-        raise RuntimeError("http-json WebSearch provider returned unsupported JSON shape. Expected a result list.")
-    content: list[dict[str, str]] = []
-    text_results: list[str] = []
-    for item in items:
-        if isinstance(item, dict) and isinstance(item.get("content"), list):
-            content.extend(_normalise_http_json_result_item(content_item) for content_item in item["content"])
-        elif isinstance(item, dict):
-            content.append(_normalise_http_json_result_item(item))
-        elif item is not None:
-            text_results.append(str(item))
-    results: list[Any] = []
-    if content:
-        results.append({"content": content})
-    results.extend(text_results)
-    return {"query": query, "results": results}
-
-
-def _normalise_http_json_search_payload(payload: Any, query: str) -> dict[str, Any]:
-    if isinstance(payload, list):
-        return _normalise_http_json_result_list(payload, query)
-    if not isinstance(payload, dict):
-        raise RuntimeError("http-json WebSearch provider returned unsupported JSON shape. Expected a JSON object or list.")
-    if "results" in payload:
-        return _normalise_http_json_result_list(payload["results"], query)
-    if "items" in payload:
-        return _normalise_http_json_result_list(payload["items"], query)
-    if "data" in payload and isinstance(payload["data"], (dict, list)):
-        return _normalise_http_json_search_payload(payload["data"], query)
-    if any(key in payload for key in ("title", "url", "link", "href", "snippet", "description", "content", "text")):
-        return {"query": query, "results": [{"content": [_normalise_http_json_result_item(payload)]}]}
-    raise RuntimeError("http-json WebSearch provider returned unsupported JSON shape. Expected results, items, or data.")
-
-
-def _anthropic_compatible_messages_endpoint(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
-    if normalized.endswith("/v1/messages"):
-        return normalized
-    if normalized.endswith("/v1"):
-        return f"{normalized}/messages"
-    return f"{normalized}/v1/messages"
-
-
-def _short_snippet(text: str, *, limit: int = 500) -> str:
-    snippet = " ".join(text.split())
-    if len(snippet) <= limit:
-        return snippet
-    return f"{snippet[: limit - 1]}..."
-
-
-def _extract_text_from_anthropic_content(content: Any) -> str:
-    parts: list[str] = []
-    if not isinstance(content, list):
-        return ""
-    for block in content:
-        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-            parts.append(block["text"])
-        elif isinstance(block, str):
-            parts.append(block)
-    return _short_snippet("\n".join(parts))
-
-
-def _extract_citation_hits_from_text_block(block: dict[str, Any]) -> list[dict[str, str]]:
-    hits: list[dict[str, str]] = []
-    citations = block.get("citations")
-    if not isinstance(citations, list):
-        return hits
-    for citation in citations:
-        if not isinstance(citation, dict):
-            continue
-        url = citation.get("url") or citation.get("source") or citation.get("uri") or ""
-        title = citation.get("title") or citation.get("document_title") or url or "Citation"
-        snippet = citation.get("cited_text") or citation.get("text") or ""
-        hit = {"title": str(title), "url": str(url)}
-        if snippet:
-            hit["snippet"] = _short_snippet(str(snippet), limit=240)
-        hits.append(hit)
-    return hits
-
-
-def _normalise_anthropic_compatible_search_response(
-    payload: Any,
-    *,
-    query: str,
-    duration_seconds: float,
-) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise RuntimeError("anthropic-compatible WebSearch provider returned unsupported JSON shape. Expected a JSON object.")
-    content = payload.get("content")
-    if not isinstance(content, list):
-        raise RuntimeError("anthropic-compatible WebSearch provider response is missing message content.")
-
-    hits: list[dict[str, str]] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "web_search_tool_result":
-            result_content = block.get("content")
-            if isinstance(result_content, list):
-                hits.extend(_normalise_http_json_result_item(item) for item in result_content)
-        elif block.get("type") == "text":
-            hits.extend(_extract_citation_hits_from_text_block(block))
-
-    if hits:
-        return {"query": query, "results": [{"content": hits}], "durationSeconds": duration_seconds}
-
-    snippet = _extract_text_from_anthropic_content(content)
-    if not snippet:
-        snippet = "Anthropic-compatible provider returned no structured search results."
-    return {
-        "query": query,
-        "results": [
-            {
-                "content": [
-                    {
-                        "title": "Anthropic-compatible search result",
-                        "url": "",
-                        "snippet": snippet,
-                    }
-                ]
-            }
-        ],
-        "durationSeconds": duration_seconds,
-    }
-
-
-def make_anthropic_compatible_web_search_handler(
-    base_url: str,
-    *,
-    api_key: str,
-    model: str,
-    timeout_seconds: float = 10.0,
-) -> WebSearchHandler:
-    """Build an opt-in Anthropic-compatible search adapter for WebSearch."""
-    url = base_url.strip()
-    key = api_key.strip()
-    model_name = model.strip()
-    if not url:
-        raise WebSearchConfigurationError(f"anthropic-compatible WebSearch provider requires {WEB_SEARCH_URL_ENV}.")
-    if not key:
-        raise WebSearchConfigurationError(f"anthropic-compatible WebSearch provider requires {WEB_SEARCH_API_KEY_ENV}.")
-    if not model_name:
-        raise WebSearchConfigurationError(f"anthropic-compatible WebSearch provider requires {WEB_SEARCH_MODEL_ENV}.")
-
-    endpoint = _anthropic_compatible_messages_endpoint(url)
-
-    def handler(args: dict[str, Any]) -> dict[str, Any]:
-        start = time.perf_counter()
-        query = str(args.get("query") or "")
-        search_tool: dict[str, Any] = {"type": "web_search_20250305", "name": "web_search", "max_uses": 8}
-        for field_name in ("allowed_domains", "blocked_domains"):
-            value = args.get(field_name)
-            if isinstance(value, list):
-                search_tool[field_name] = value
-        prompt_lines = [f"Perform a web search for the query: {query}"]
-        if isinstance(args.get("allowed_domains"), list):
-            prompt_lines.append(f"Only include results from these domains: {', '.join(args['allowed_domains'])}")
-        if isinstance(args.get("blocked_domains"), list):
-            prompt_lines.append(f"Do not include results from these domains: {', '.join(args['blocked_domains'])}")
-        prompt_lines.append("Return concise search results with titles, URLs, and short snippets when available.")
-        request_body = {
-            "model": model_name,
-            "max_tokens": 1024,
-            "system": "You are an assistant for performing a web search tool use.",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [{"type": "text", "text": "\n".join(prompt_lines)}],
-                }
-            ],
-            "tools": [search_tool],
-            "stream": False,
-        }
-        payload = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "Authorization": f"Bearer {key}",
-        }
-        request = Request(endpoint, data=payload, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except HTTPError as exc:
-            raise RuntimeError(f"anthropic-compatible WebSearch provider request failed with HTTP {exc.code}.") from exc
-        except (TimeoutError, socket.timeout) as exc:
-            raise RuntimeError("anthropic-compatible WebSearch provider request timed out.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"anthropic-compatible WebSearch provider request failed: {exc.reason}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"anthropic-compatible WebSearch provider request failed: {exc.__class__.__name__}.") from exc
-        try:
-            response_payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("anthropic-compatible WebSearch provider returned invalid JSON.") from exc
-        duration_seconds = time.perf_counter() - start
-        return _normalise_anthropic_compatible_search_response(
-            response_payload,
-            query=query,
-            duration_seconds=duration_seconds,
-        )
-
-    return handler
-
-
-def make_http_json_web_search_handler(
-    search_url: str,
-    *,
-    api_key: str | None = None,
-    timeout_seconds: float = 10.0,
-) -> WebSearchHandler:
-    """Build an opt-in, standard-library HTTP JSON WebSearch adapter."""
-    url = search_url.strip()
-    if not url:
-        raise WebSearchConfigurationError(f"http-json WebSearch provider requires {WEB_SEARCH_URL_ENV}.")
-
-    def handler(args: dict[str, Any]) -> dict[str, Any]:
-        query = str(args.get("query") or "")
-        request_body: dict[str, Any] = {"query": query}
-        for field_name in ("allowed_domains", "blocked_domains"):
-            value = args.get(field_name)
-            if isinstance(value, list):
-                request_body[field_name] = value
-        payload = json.dumps(request_body).encode("utf-8")
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        request = Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                raw = response.read().decode("utf-8")
-        except HTTPError as exc:
-            raise RuntimeError(f"http-json WebSearch provider request failed with HTTP {exc.code}.") from exc
-        except (TimeoutError, socket.timeout) as exc:
-            raise RuntimeError("http-json WebSearch provider request timed out.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"http-json WebSearch provider request failed: {exc.reason}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"http-json WebSearch provider request failed: {exc.__class__.__name__}.") from exc
-        try:
-            response_payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("http-json WebSearch provider returned invalid JSON.") from exc
-        return _normalise_http_json_search_payload(response_payload, query)
-
-    return handler
-
-
-def _parse_web_search_timeout(value: str | None) -> float:
-    if value is None or not value.strip():
-        return 10.0
-    try:
-        timeout = float(value)
-    except ValueError as exc:
-        raise WebSearchConfigurationError(f"{WEB_SEARCH_TIMEOUT_ENV} must be a positive number.") from exc
-    if timeout <= 0:
-        raise WebSearchConfigurationError(f"{WEB_SEARCH_TIMEOUT_ENV} must be a positive number.")
-    return timeout
-
-
-def _parse_web_fetch_timeout(value: str | None) -> float:
-    if value is None or not value.strip():
-        return 10.0
-    try:
-        timeout = float(value)
-    except ValueError as exc:
-        raise WebFetchConfigurationError(f"{WEB_FETCH_TIMEOUT_ENV} must be a positive number.") from exc
-    if timeout <= 0:
-        raise WebFetchConfigurationError(f"{WEB_FETCH_TIMEOUT_ENV} must be a positive number.")
-    return timeout
-
-
-def _parse_positive_int_env(value: str | None, env_name: str, default: int) -> int:
-    if value is None or not value.strip():
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise WebFetchConfigurationError(f"{env_name} must be a positive integer.") from exc
-    if parsed <= 0:
-        raise WebFetchConfigurationError(f"{env_name} must be a positive integer.")
-    return parsed
-
-
-def _validate_fetch_url(url: str) -> None:
-    try:
-        parsed = urlparse(url)
-    except ValueError as exc:
-        raise RuntimeError(f"WebFetch invalid URL: {url}") from exc
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise RuntimeError("WebFetch invalid URL. Only http and https URLs are supported.")
-
-
-def make_unavailable_web_fetch_handler() -> WebFetchHandler:
-    """Build the local runner's default no-network WebFetch handler."""
-
-    def handler(url: str) -> dict[str, Any]:
-        raise RuntimeError(format_web_fetch_unavailable_message())
-
-    return handler
+    return wrapped
 
 
 def make_http_web_fetch_handler(
@@ -447,98 +125,23 @@ def make_http_web_fetch_handler(
     max_bytes: int = 1_000_000,
     max_chars: int = 100_000,
 ) -> WebFetchHandler:
-    """Build an opt-in, standard-library HTTP(S) WebFetch handler."""
+    """Compatibility wrapper around the internal HTTP WebFetch handler."""
+    _sync_web_adapter_urlopen()
+    handler = _web_adapters.make_http_web_fetch_handler(
+        timeout_seconds=timeout_seconds,
+        max_bytes=max_bytes,
+        max_chars=max_chars,
+    )
 
-    def handler(url: str) -> dict[str, Any]:
-        _validate_fetch_url(url)
-        request = Request(
-            url,
-            headers={
-                "Accept": "text/markdown, text/plain, text/html, */*",
-                "User-Agent": "agent-kernel-local-runner/0.3",
-            },
-            method="GET",
-        )
-        try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                raw = response.read(max_bytes + 1)
-                if len(raw) > max_bytes:
-                    raise RuntimeError(f"WebFetch response exceeds {max_bytes} byte limit.")
-                content_type = response.headers.get("content-type", "") if getattr(response, "headers", None) is not None else ""
-                status_code = int(getattr(response, "status", response.getcode() if hasattr(response, "getcode") else 200))
-                reason = str(getattr(response, "reason", "") or "")
-        except HTTPError as exc:
-            raise RuntimeError(f"WebFetch request failed with HTTP {exc.code}.") from exc
-        except (TimeoutError, socket.timeout) as exc:
-            raise RuntimeError("WebFetch request timed out.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"WebFetch request failed: {exc.reason}") from exc
-        except OSError as exc:
-            raise RuntimeError(f"WebFetch request failed: {exc.__class__.__name__}.") from exc
-        content = raw.decode("utf-8", errors="replace")
-        if len(content) > max_chars:
-            raise RuntimeError(f"WebFetch response exceeds {max_chars} character limit.")
-        return {
-            "bytes": len(raw),
-            "code": status_code,
-            "codeText": reason or ("OK" if 200 <= status_code < 300 else "HTTP Error"),
-            "content": content,
-            "contentType": content_type,
-            "url": url,
-        }
+    def wrapped(url: str) -> Any:
+        _sync_web_adapter_urlopen()
+        return handler(url)
 
-    return handler
+    return wrapped
 
 
-def build_web_fetch_handler_from_env(env: Mapping[str, str] | None = None) -> WebFetchHandler | None:
-    """Build an example-level WebFetch handler from environment settings."""
-    values = env or os.environ
-    provider = (values.get(WEB_FETCH_PROVIDER_ENV) or "").strip().lower()
-    if not provider:
-        return None
-    if provider != "http":
-        raise WebFetchConfigurationError(f"Unsupported WebFetch provider '{provider}'. Local runner supports opt-in 'http'.")
-    timeout_seconds = _parse_web_fetch_timeout(values.get(WEB_FETCH_TIMEOUT_ENV))
-    max_bytes = _parse_positive_int_env(values.get(WEB_FETCH_MAX_BYTES_ENV), WEB_FETCH_MAX_BYTES_ENV, 1_000_000)
-    max_chars = _parse_positive_int_env(values.get(WEB_FETCH_MAX_CHARS_ENV), WEB_FETCH_MAX_CHARS_ENV, 100_000)
-    return make_http_web_fetch_handler(timeout_seconds=timeout_seconds, max_bytes=max_bytes, max_chars=max_chars)
-
-
-def build_web_search_handler_from_env(env: Mapping[str, str] | None = None) -> WebSearchHandler | None:
-    """Build an example-level WebSearch handler from environment settings.
-
-    ``stub`` is deterministic and local. ``http-json`` and
-    ``anthropic-compatible`` are opt-in only and use Python's standard library
-    to call caller-provided endpoints.
-    """
-    values = env or os.environ
-    provider = (values.get(WEB_SEARCH_PROVIDER_ENV) or "").strip().lower()
-    if not provider:
-        return None
-    if provider == "stub":
-        results_path = values.get(WEB_SEARCH_STUB_RESULTS_ENV)
-        results = _load_stub_results(results_path) if results_path else None
-        return make_stub_web_search_handler(results)
-    if provider == "http-json":
-        search_url = values.get(WEB_SEARCH_URL_ENV) or ""
-        timeout_seconds = _parse_web_search_timeout(values.get(WEB_SEARCH_TIMEOUT_ENV))
-        return make_http_json_web_search_handler(
-            search_url,
-            api_key=values.get(WEB_SEARCH_API_KEY_ENV),
-            timeout_seconds=timeout_seconds,
-        )
-    if provider == "anthropic-compatible":
-        timeout_seconds = _parse_web_search_timeout(values.get(WEB_SEARCH_TIMEOUT_ENV))
-        return make_anthropic_compatible_web_search_handler(
-            values.get(WEB_SEARCH_URL_ENV) or "",
-            api_key=values.get(WEB_SEARCH_API_KEY_ENV) or "",
-            model=values.get(WEB_SEARCH_MODEL_ENV) or "",
-            timeout_seconds=timeout_seconds,
-        )
-    else:
-        raise WebSearchConfigurationError(
-            f"Unsupported WebSearch provider '{provider}'. Local runner supports 'stub', opt-in 'http-json', and opt-in 'anthropic-compatible'."
-        )
+make_stub_web_search_handler = _web_adapters.make_stub_web_search_handler
+make_unavailable_web_fetch_handler = _web_adapters.make_unavailable_web_fetch_handler
 
 
 def _apply_permission_mode(engine: QueryEngine, permission_mode: str) -> None:
@@ -555,15 +158,119 @@ def discover_local_skills(skills_dir: str | Path) -> list[SkillDefinition]:
     if not root.is_dir():
         raise SkillsConfigurationError(f"Skills path is not a directory: {root}")
     skills: list[SkillDefinition] = []
+    seen: dict[str, Path] = {}
     for child in sorted(root.iterdir(), key=lambda path: path.name):
         if not child.is_dir():
             continue
         skill = skill_from_markdown(child / "SKILL.md", name=child.name, loaded_from=str(root), source="local-runner")
         if skill is not None:
+            if skill.name in seen:
+                raise SkillsConfigurationError(f"Duplicate skill name '{skill.name}' in {root}: {seen[skill.name]} and {child / 'SKILL.md'}")
+            seen[skill.name] = child / "SKILL.md"
             skills.append(skill)
     if not skills:
         raise SkillsConfigurationError(f"No valid skills found in {root}. Expected child directories containing SKILL.md.")
     return skills
+
+
+def _runner_config(cwd: str | Path | None = None, config_home: str | Path | None = None) -> KernelConfig:
+    config_kwargs: dict[str, Any] = {"cwd": Path(cwd).expanduser() if cwd is not None else Path.cwd()}
+    if config_home is not None:
+        config_kwargs["config_home"] = Path(config_home).expanduser()
+    return KernelConfig(**config_kwargs)
+
+
+def _session_project_dir(cwd: str | Path | None = None, config_home: str | Path | None = None) -> Path:
+    config = _runner_config(cwd, config_home)
+    return SessionStore(config, session_id="__probe__").project_dir
+
+
+def list_local_sessions(cwd: str | Path | None = None, config_home: str | Path | None = None) -> list[str]:
+    """Return deterministic local transcript session ids for the runner project."""
+    project_dir = _session_project_dir(cwd, config_home)
+    if not project_dir.exists():
+        return []
+    return sorted(path.stem for path in project_dir.glob("*.jsonl") if path.is_file())
+
+
+def latest_local_session_id(cwd: str | Path | None = None, config_home: str | Path | None = None) -> str | None:
+    """Return the most recently modified local transcript session id."""
+    project_dir = _session_project_dir(cwd, config_home)
+    if not project_dir.exists():
+        return None
+    sessions = [path for path in project_dir.glob("*.jsonl") if path.is_file()]
+    if not sessions:
+        return None
+    latest = max(sessions, key=lambda path: (path.stat().st_mtime, path.name))
+    return latest.stem
+
+
+def _memory_loader(cwd: str | Path | None = None, config_home: str | Path | None = None) -> MemoryLoader:
+    return MemoryLoader(_runner_config(cwd, config_home))
+
+
+def _resolve_memory_path(
+    loader: MemoryLoader,
+    relative_path: str | Path | None,
+) -> Path:
+    path = Path(relative_path or ENTRYPOINT_NAME)
+    if path.is_absolute():
+        raise MemoryConfigurationError("Memory path must be relative.")
+    if not path.parts or any(part == ".." for part in path.parts):
+        raise MemoryConfigurationError("Memory path must stay inside the project memory directory.")
+    memory_dir = loader.get_auto_mem_path()
+    target = (memory_dir / path).resolve()
+    root = memory_dir.resolve()
+    if target != root and root not in target.parents:
+        raise MemoryConfigurationError("Memory path must stay inside the project memory directory.")
+    return target
+
+
+def memory_status_lines(cwd: str | Path | None = None, config_home: str | Path | None = None) -> list[str]:
+    """Return local memory status without creating or modifying memory files."""
+    loader = _memory_loader(cwd, config_home)
+    memory_dir = loader.get_auto_mem_path()
+    entrypoint = memory_dir / ENTRYPOINT_NAME
+    return [
+        f"memory_dir={memory_dir}",
+        f"memory_dir_exists={str(memory_dir.exists()).lower()}",
+        f"entrypoint={entrypoint}",
+        f"entrypoint_exists={str(entrypoint.exists()).lower()}",
+    ]
+
+
+def read_memory_file(
+    relative_path: str | Path | None = None,
+    *,
+    cwd: str | Path | None = None,
+    config_home: str | Path | None = None,
+) -> str:
+    """Read a safe relative memory file path."""
+    target = _resolve_memory_path(_memory_loader(cwd, config_home), relative_path)
+    try:
+        return target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise MemoryConfigurationError(f"Memory file does not exist: {relative_path or ENTRYPOINT_NAME}") from exc
+    except OSError as exc:
+        raise MemoryConfigurationError(f"Unable to read memory file: {exc}") from exc
+
+
+def write_memory_file(
+    relative_path: str | Path,
+    text: str,
+    *,
+    cwd: str | Path | None = None,
+    config_home: str | Path | None = None,
+) -> Path:
+    """Write a safe relative memory file path, creating parent directories."""
+    target = _resolve_memory_path(_memory_loader(cwd, config_home), relative_path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        target.chmod(0o600)
+    except OSError as exc:
+        raise MemoryConfigurationError(f"Unable to write memory file: {exc}") from exc
+    return target
 
 
 def _load_json_file(path: Path, label: str) -> Any:
@@ -671,8 +378,10 @@ def build_local_engine(
     web_fetch_handler: WebFetchHandler | None = None,
     skills_dir: str | Path | None = None,
     mcp_fixture: str | Path | None = None,
+    mcp_config: str | Path | None = None,
     permission_mode: str = "ask",
     require_api_key: bool = True,
+    resume: bool = False,
 ) -> QueryEngine:
     """Build a QueryEngine for local example use.
 
@@ -683,29 +392,44 @@ def build_local_engine(
     if skills_dir is not None:
         skills_path = Path(skills_dir).expanduser()
         discover_local_skills(skills_path)
-    mcp_clients: tuple[MCPClientConfig, ...] = ()
-    if mcp_fixture is not None:
-        mcp_clients = (load_mcp_fixture(mcp_fixture),)
-
+    mcp_fixture_path = Path(mcp_fixture).expanduser() if mcp_fixture is not None else None
+    if mcp_fixture_path is not None:
+        if not mcp_fixture_path.exists():
+            raise MCPFixtureConfigurationError(f"MCP fixture does not exist: {mcp_fixture_path}")
+        if not mcp_fixture_path.is_file():
+            raise MCPFixtureConfigurationError(f"MCP fixture path is not a file: {mcp_fixture_path}")
+    mcp_config_path = Path(mcp_config).expanduser() if mcp_config is not None else None
+    if mcp_config_path is not None:
+        if not mcp_config_path.exists():
+            raise MCPConfigurationError(f"MCP config does not exist: {mcp_config_path}")
+        if not mcp_config_path.is_file():
+            raise MCPConfigurationError(f"MCP config path is not a file: {mcp_config_path}")
     if model_provider is None:
         if require_api_key and not has_api_credentials():
             raise MissingCredentialsError(
-                "Missing Anthropic-compatible API credentials. Set ANTHROPIC_AUTH_TOKEN "
-                "or ANTHROPIC_API_KEY. Optional: ANTHROPIC_BASE_URL and ANTHROPIC_MODEL."
+                "Missing Anthropic-compatible API credentials. Set AGENT_KERNEL_API_KEY, "
+                "ANTHROPIC_AUTH_TOKEN, or ANTHROPIC_API_KEY. For OpenAI modes, set "
+                "AGENT_KERNEL_PROVIDER=openai-chat or openai-responses and provide "
+                "AGENT_KERNEL_API_KEY or OPENAI_API_KEY. Optional: AGENT_KERNEL_BASE_URL "
+                "and AGENT_KERNEL_MODEL."
             )
-        model_provider = AnthropicModelProvider.from_env()
+        model_provider = build_model_provider_from_env(require_credentials=require_api_key)
+
+    mcp_clients: tuple[MCPClientConfig, ...] = ()
+    if mcp_fixture_path is not None:
+        mcp_clients = (*mcp_clients, load_mcp_fixture(mcp_fixture_path))
+    if mcp_config_path is not None:
+        mcp_clients = (*mcp_clients, *load_mcp_config(mcp_config_path, cwd=cwd))
 
     config_kwargs: dict[str, Any] = {"cwd": Path(cwd).expanduser() if cwd is not None else Path.cwd()}
     if config_home is not None:
         config_kwargs["config_home"] = Path(config_home).expanduser()
     if skills_path is not None:
         config_kwargs["skill_paths"] = (skills_path,)
+    config_kwargs["skill_discovery_mode"] = "explicit"
     if mcp_clients:
         config_kwargs["mcp_clients"] = mcp_clients
     config = KernelConfig(**config_kwargs)
-    # The local runner loads only the explicitly supplied --skills-dir. This
-    # keeps examples deterministic without changing QueryEngine defaults.
-    setattr(config, "_agent_kernel_skill_paths_only", True)
 
     engine_kwargs: dict[str, Any] = {
         "model_provider": model_provider,
@@ -715,7 +439,10 @@ def build_local_engine(
         engine_kwargs["session_id"] = session_id
     if model is not None:
         engine_kwargs["model"] = model
+    if resume:
+        engine_kwargs["resume"] = True
     engine = QueryEngine(**engine_kwargs)
+    setattr(engine, "_agent_kernel_owned_mcp_clients", mcp_clients)
     _apply_permission_mode(engine, permission_mode)
     if web_search_handler is not None:
         engine.tool_use_context.web_search_handler = web_search_handler
@@ -841,6 +568,7 @@ async def run_local_agent_once(
     web_fetch_handler: WebFetchHandler | None = None,
     skills_dir: str | Path | None = None,
     mcp_fixture: str | Path | None = None,
+    mcp_config: str | Path | None = None,
     permission_mode: str | None = None,
     max_turns: int = 10,
     sdk_events: bool = True,
@@ -848,6 +576,7 @@ async def run_local_agent_once(
     require_api_key: bool = True,
 ) -> LocalAgentRun:
     """Run one prompt through QueryEngine and collect logs plus final text."""
+    created_engine = engine is None
     if engine is None:
         engine = build_local_engine(
             cwd=cwd,
@@ -859,6 +588,7 @@ async def run_local_agent_once(
             web_fetch_handler=web_fetch_handler,
             skills_dir=skills_dir,
             mcp_fixture=mcp_fixture,
+            mcp_config=mcp_config,
             permission_mode=permission_mode or "ask",
             require_api_key=require_api_key,
         )
@@ -875,12 +605,16 @@ async def run_local_agent_once(
         if event_logger is not None:
             event_logger(line)
 
-    async for event in engine.submit_message(prompt, max_turns=max_turns, sdk_events=sdk_events):
-        events.append(event)
-        for line in format_event_log(event):
-            logs.append(line)
-            if event_logger is not None:
-                event_logger(line)
+    try:
+        async for event in engine.submit_message(prompt, max_turns=max_turns, sdk_events=sdk_events):
+            events.append(event)
+            for line in format_event_log(event):
+                logs.append(line)
+                if event_logger is not None:
+                    event_logger(line)
+    finally:
+        if created_engine:
+            close_mcp_clients(getattr(engine, "_agent_kernel_owned_mcp_clients", ()))
 
     final_response = ""
     for event in reversed(events):
@@ -904,9 +638,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="*", help="Prompt text. If omitted, the runner asks for one line on stdin.")
     parser.add_argument("--repl", action="store_true", help="Keep the same QueryEngine session open for repeated prompts.")
     parser.add_argument("--cwd", type=Path, default=Path.cwd(), help="Working directory for tool permissions and prompt context.")
-    parser.add_argument("--config-home", type=Path, help="Override CLAUDE-style config/transcript home.")
+    parser.add_argument("--config-home", type=Path, help="Override local config/transcript home.")
     parser.add_argument("--session-id", help="Use a stable transcript session id.")
-    parser.add_argument("--model", help="Override ANTHROPIC_MODEL for this runner.")
+    parser.add_argument("--list-sessions", action="store_true", help="List local transcript session ids for this cwd.")
+    parser.add_argument("--resume", metavar="SESSION_ID", help="Resume an existing transcript session id.")
+    parser.add_argument("--continue", dest="continue_session", action="store_true", help="Resume the most recently modified local session.")
+    parser.add_argument("--memory-status", action="store_true", help="Show local project memory status without mutating files.")
+    parser.add_argument("--memory-read", nargs="?", const=ENTRYPOINT_NAME, metavar="RELATIVE_PATH", help="Read a relative project memory file.")
+    parser.add_argument("--memory-write", metavar="RELATIVE_PATH", help="Write a relative project memory file.")
+    parser.add_argument("--memory-text", help="Text to write with --memory-write.")
+    parser.add_argument("--model", help="Override the configured model for this runner.")
     parser.add_argument("--max-turns", type=int, default=10, help="Maximum model turns per submitted prompt.")
     parser.add_argument("--permission-mode", choices=("ask", "bypass"), default="ask", help="Permission mode to pass through to the kernel.")
     parser.add_argument("--enable-web-search", action="store_true", help=f"Enable example WebSearch provider from {WEB_SEARCH_PROVIDER_ENV}.")
@@ -915,12 +656,61 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-web-fetch", action="store_true", help=f"Enable example WebFetch provider from {WEB_FETCH_PROVIDER_ENV}.")
     parser.add_argument("--web-fetch-provider", choices=("http",), help="Example WebFetch provider override.")
     parser.add_argument("--skills-dir", type=Path, help="Load local skills from child directories containing SKILL.md.")
+    parser.add_argument("--list-skills", action="store_true", help="List skills from --skills-dir without calling a model.")
     parser.add_argument("--mcp-fixture", type=Path, help="Load a local-only MCP smoke fixture JSON file.")
+    parser.add_argument("--mcp-config", type=Path, help=f"Load local stdio MCP servers from config JSON. Env: {MCP_CONFIG_ENV}.")
     parser.add_argument("--quiet", action="store_true", help="Only print assistant final responses to stdout.")
     return parser
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
+    if args.list_sessions:
+        sessions = list_local_sessions(args.cwd, args.config_home)
+        if not sessions:
+            print("No sessions found.")
+            return 0
+        for session_id in sessions:
+            print(session_id)
+        return 0
+
+    if args.memory_status:
+        for line in memory_status_lines(args.cwd, args.config_home):
+            print(line)
+        return 0
+
+    if args.memory_read is not None:
+        try:
+            print(read_memory_file(args.memory_read, cwd=args.cwd, config_home=args.config_home), end="")
+        except MemoryConfigurationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return 0
+
+    if args.memory_write is not None:
+        if args.memory_text is None:
+            print("error: --memory-write requires --memory-text.", file=sys.stderr)
+            return 2
+        try:
+            path = write_memory_file(args.memory_write, args.memory_text, cwd=args.cwd, config_home=args.config_home)
+        except MemoryConfigurationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"wrote {path}")
+        return 0
+
+    if args.list_skills:
+        if args.skills_dir is None:
+            print("No skills loaded. Pass --skills-dir PATH to inspect local skills.")
+            return 0
+        try:
+            skills = discover_local_skills(args.skills_dir)
+        except SkillsConfigurationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for skill in skills:
+            print(f"{skill.name}\t{skill.display_description()}")
+        return 0
+
     if args.skills_dir is not None:
         try:
             discover_local_skills(args.skills_dir)
@@ -967,22 +757,47 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(f"hint: set {WEB_FETCH_PROVIDER_ENV}=http or pass --web-fetch-provider http", file=sys.stderr)
             return 2
 
+    mcp_config = args.mcp_config or (Path(os.environ[MCP_CONFIG_ENV]).expanduser() if os.environ.get(MCP_CONFIG_ENV) else None)
+    if args.resume and args.continue_session:
+        print("error: use either --resume SESSION_ID or --continue, not both.", file=sys.stderr)
+        return 2
+    if args.session_id and args.resume:
+        print("error: use either --session-id or --resume SESSION_ID, not both.", file=sys.stderr)
+        return 2
+    session_id = args.session_id
+    resume = False
+    if args.resume:
+        session_id = args.resume
+        resume = True
+    elif args.continue_session:
+        latest_session = latest_local_session_id(args.cwd, args.config_home)
+        if latest_session is None:
+            print("error: no local sessions found to continue.", file=sys.stderr)
+            return 2
+        session_id = latest_session
+        resume = True
+
     try:
         engine = build_local_engine(
             cwd=args.cwd,
             config_home=args.config_home,
-            session_id=args.session_id,
+            session_id=session_id,
             model=args.model,
             web_search_handler=web_search_handler,
             web_fetch_handler=web_fetch_handler,
             skills_dir=args.skills_dir,
             mcp_fixture=args.mcp_fixture,
+            mcp_config=mcp_config,
             permission_mode=args.permission_mode,
+            resume=resume,
         )
     except MissingCredentialsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except MCPFixtureConfigurationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except MCPConfigurationError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -991,36 +806,39 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(line, file=sys.stderr)
 
     prompt = " ".join(args.prompt).strip()
-    if args.repl:
-        if prompt:
-            prompts = [prompt]
-        else:
-            prompts = []
-        while True:
-            if prompts:
-                next_prompt = prompts.pop(0)
+    try:
+        if args.repl:
+            if prompt:
+                prompts = [prompt]
             else:
-                try:
-                    next_prompt = input("user> ").strip()
-                except EOFError:
+                prompts = []
+            while True:
+                if prompts:
+                    next_prompt = prompts.pop(0)
+                else:
+                    try:
+                        next_prompt = input("user> ").strip()
+                    except EOFError:
+                        break
+                if not next_prompt or next_prompt.lower() in {"exit", "quit"}:
                     break
-            if not next_prompt or next_prompt.lower() in {"exit", "quit"}:
-                break
-            result = await run_local_agent_once(next_prompt, engine=engine, max_turns=args.max_turns, event_logger=log)
-            print(result.final_response)
-        return 0
+                result = await run_local_agent_once(next_prompt, engine=engine, max_turns=args.max_turns, event_logger=log)
+                print(result.final_response)
+            return 0
 
-    if not prompt:
-        try:
-            prompt = input("user> ").strip()
-        except EOFError:
-            prompt = ""
-    if not prompt:
-        print("error: prompt is empty", file=sys.stderr)
-        return 2
-    result = await run_local_agent_once(prompt, engine=engine, max_turns=args.max_turns, event_logger=log)
-    print(result.final_response)
-    return 0
+        if not prompt:
+            try:
+                prompt = input("user> ").strip()
+            except EOFError:
+                prompt = ""
+        if not prompt:
+            print("error: prompt is empty", file=sys.stderr)
+            return 2
+        result = await run_local_agent_once(prompt, engine=engine, max_turns=args.max_turns, event_logger=log)
+        print(result.final_response)
+        return 0
+    finally:
+        close_mcp_clients(getattr(engine, "_agent_kernel_owned_mcp_clients", ()))
 
 
 def main(argv: Sequence[str] | None = None) -> int:

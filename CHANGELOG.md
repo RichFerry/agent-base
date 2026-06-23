@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- Added provider selection for Anthropic-compatible Messages, OpenAI Chat Completions, and OpenAI Responses while keeping `ModelProvider.stream(...)` as the internal kernel interface.
+- Moved reusable WebSearch/WebFetch adapter construction into an internal adapter module and kept all network behavior explicit opt-in.
+- Added local-only MCP stdio config loading with stdlib JSON-RPC lifecycle support.
+- Added explicit skill discovery mode, deterministic local runner skill loading, duplicate skill reporting, and `--list-skills`.
+- Added local runner session commands for listing, resume, and continue.
+- Added explicit memory status/read/write CLI commands with relative-path safety checks and no automatic memory extraction.
+- Updated EN/CH README and v0.4 release documentation.
+
 ## 0.3.0
 
 - Added opt-in real smoke documentation and tests for real model, real runner E2E, WebSearch adapters, WebFetch handler, and MCP stdio smoke.

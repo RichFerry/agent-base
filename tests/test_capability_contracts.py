@@ -303,15 +303,14 @@ def test_unsupported_scopes_remain_explicit_contract(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """v0.2 does not silently grow network search, real MCP server, or forked skills."""
+    """Unsupported network search and forked skills stay explicit; MCP config fails clearly."""
     with pytest.raises(WebSearchConfigurationError, match="Unsupported WebSearch provider"):
         build_web_search_handler_from_env({WEB_SEARCH_PROVIDER_ENV: "real-network"})
 
-    with pytest.raises(SystemExit) as excinfo:
-        main(["--mcp-config", "server.json", "hello"])
+    exit_code = main(["--mcp-config", "server.json", "hello"])
     captured = capsys.readouterr()
-    assert excinfo.value.code == 2
-    assert "unrecognized arguments: --mcp-config" in captured.err
+    assert exit_code == 2
+    assert "MCP config does not exist: server.json" in captured.err
 
     skills_root = tmp_path / "skills"
     _write_skill(
