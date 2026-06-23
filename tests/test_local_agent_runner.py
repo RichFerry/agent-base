@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from agent_kernel.model_provider import FakeModelProvider
+from agent_kernel.model_provider import FakeModelProvider, OpenAIChatModelProvider
 from agent_kernel.query_engine import QueryEngine
 import examples.local_agent as local_agent
 from examples.local_agent import (
@@ -28,6 +28,8 @@ from examples.local_agent import (
     WEB_SEARCH_PROVIDER_ENV,
     WEB_SEARCH_TIMEOUT_ENV,
     WEB_SEARCH_URL_ENV,
+    DEFAULT_LOCAL_CONFIG_NAME,
+    LocalConfigError,
     MCPFixtureConfigurationError,
     MissingCredentialsError,
     SkillsConfigurationError,
@@ -39,13 +41,17 @@ from examples.local_agent import (
     discover_local_skills,
     format_web_search_unavailable_message,
     latest_local_session_id,
+    list_memory_files,
     list_local_sessions,
+    load_local_runner_config,
     load_mcp_fixture,
     main,
     make_http_web_fetch_handler,
     make_stub_web_search_handler,
     read_memory_file,
     run_local_agent_once,
+    validate_memory,
+    validate_local_skills,
     write_memory_file,
 )
 from agent_kernel.skills import SkillTool
@@ -113,6 +119,296 @@ def test_local_agent_script_can_run_as_file_help() -> None:
     assert result.returncode == 0
     assert "Run one prompt through the local Python Agent Kernel" in result.stdout
     assert result.stderr == ""
+
+
+def test_cli_init_config_writes_starter_config_without_secrets(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """--init-config creates a local JSON config template without storing keys."""
+    config_path = tmp_path / DEFAULT_LOCAL_CONFIG_NAME
+
+    exit_code = main(["--cwd", str(tmp_path), "--init-config", str(config_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert f"wrote {config_path}" in captured.out
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["provider"]["type"] == "anthropic"
+    assert "api" not in json.dumps(payload).lower()
+    assert captured.err == ""
+
+
+def test_cli_doctor_reads_config_without_model_credentials(capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--doctor reports effective local config without calling a model or network."""
+    monkeypatch.delenv("AGENT_KERNEL_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    skills_root = tmp_path / "skills"
+    _write_skill(skills_root, "echo", "Echo locally.")
+    config_path = tmp_path / "agent-kernel.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "provider": {"type": "openai-chat", "model": "gpt-test", "baseUrl": "https://example.invalid"},
+                "runner": {"permissionMode": "bypass", "maxTurns": 3},
+                "webSearch": {"enabled": True, "provider": "stub"},
+                "webFetch": {"enabled": False, "provider": "http"},
+                "skills": {"dir": "skills"},
+                "mcp": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--cwd", str(tmp_path), "--agent-config", str(config_path), "--doctor"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert f"config_path={config_path}" in captured.out
+    assert "provider=openai-chat" in captured.out
+    assert "model=gpt-test" in captured.out
+    assert "credentials=missing" in captured.out
+    assert "permission_mode=bypass" in captured.out
+    assert "max_turns=3" in captured.out
+    assert f"skills_dir={skills_root} status=ok type=dir" in captured.out
+    assert captured.err == ""
+
+
+def test_config_skills_dir_feeds_list_skills(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """Config file defaults can drive local inspection commands before provider setup."""
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "echo",
+        """---
+name: echo
+description: Echo from config
+---
+Echo.
+""",
+    )
+    config_path = tmp_path / "agent-kernel.json"
+    config_path.write_text(json.dumps({"skills": {"dir": "skills"}}), encoding="utf-8")
+
+    exit_code = main(["--cwd", str(tmp_path), "--agent-config", str(config_path), "--list-skills"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "echo\tEcho from config" in captured.out
+    assert captured.err == ""
+
+
+def test_cli_flags_override_config_for_doctor(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """Explicit CLI flags override persisted local config defaults."""
+    config_path = tmp_path / "agent-kernel.json"
+    config_path.write_text(json.dumps({"runner": {"permissionMode": "bypass", "maxTurns": 3}}), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--cwd",
+            str(tmp_path),
+            "--agent-config",
+            str(config_path),
+            "--permission-mode",
+            "ask",
+            "--max-turns",
+            "7",
+            "--doctor",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "permission_mode=ask" in captured.out
+    assert "max_turns=7" in captured.out
+
+
+def test_settings_json_project_user_explicit_precedence_and_env_override(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """settings.json layers merge deterministically and AGENT_KERNEL_* env wins over settings."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    config_home.mkdir()
+    (config_home / DEFAULT_LOCAL_CONFIG_NAME).write_text(
+        json.dumps({"provider": {"type": "anthropic", "model": "user-model"}, "runner": {"maxTurns": 2}}),
+        encoding="utf-8",
+    )
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(
+        json.dumps({"provider": {"type": "openai-chat", "model": "project-model"}, "runner": {"permissionMode": "bypass"}}),
+        encoding="utf-8",
+    )
+    explicit = tmp_path / "explicit-settings.json"
+    explicit.write_text(json.dumps({"runner": {"maxTurns": 5}}), encoding="utf-8")
+    monkeypatch.setenv("AGENT_KERNEL_MODEL", "env-model")
+
+    exit_code = main(["--cwd", str(repo), "--config-home", str(config_home), "--agent-config", str(explicit), "--print-effective-config"])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["provider"]["type"] == "openai-chat"
+    assert payload["provider"]["model"] == "env-model"
+    assert payload["runner"]["permissionMode"] == "bypass"
+    assert payload["runner"]["maxTurns"] == 5
+    assert [Path(path).name for path in payload["configPaths"]] == [DEFAULT_LOCAL_CONFIG_NAME, DEFAULT_LOCAL_CONFIG_NAME, "explicit-settings.json"]
+    assert captured.err == ""
+
+
+def test_settings_json_rejects_secret_like_supported_fields(tmp_path: Path) -> None:
+    """Runner settings reject API keys in supported sections while ignoring unrelated TS settings sections."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    config_home.mkdir()
+    (config_home / DEFAULT_LOCAL_CONFIG_NAME).write_text(json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "sk-not-for-this-runner-123456789"}}), encoding="utf-8")
+    assert load_local_runner_config(cwd=repo, config_home=config_home).paths == ((config_home / DEFAULT_LOCAL_CONFIG_NAME),)
+
+    bad = repo / DEFAULT_LOCAL_CONFIG_NAME
+    bad.write_text(json.dumps({"provider": {"apiKey": "sk-should-not-be-here-123456789"}}), encoding="utf-8")
+    with pytest.raises(LocalConfigError, match="looks like a secret"):
+        load_local_runner_config(cwd=repo, config_home=config_home)
+
+
+def test_settings_json_rejects_unsafe_memory_default_path(tmp_path: Path) -> None:
+    """memory.defaultPath is config, but still follows memory path confinement."""
+    repo = _repo(tmp_path)
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(json.dumps({"memory": {"defaultPath": "../outside.md"}}), encoding="utf-8")
+
+    with pytest.raises(LocalConfigError, match="memory.defaultPath must be a relative path"):
+        load_local_runner_config(cwd=repo, config_home=tmp_path / ".claude")
+
+
+def test_settings_memory_defaults_drive_cli_and_engine(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """memory.enabled/defaultPath in settings affect local CLI memory defaults and kernel config."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(
+        json.dumps({"memory": {"enabled": False, "defaultPath": "NOTES.md"}}),
+        encoding="utf-8",
+    )
+    engine = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["ok"]),
+        memory_enabled=False,
+        require_api_key=False,
+    )
+
+    status_code = main(["memory", "status", "--cwd", str(repo), "--config-home", str(config_home)])
+    status = capsys.readouterr()
+    write_code = main(["--cwd", str(repo), "--config-home", str(config_home), "--memory-write", "NOTES.md", "--memory-text", "custom index"])
+    capsys.readouterr()
+    read_code = main(["memory", "read", "--cwd", str(repo), "--config-home", str(config_home)])
+    read = capsys.readouterr()
+
+    assert engine.config.auto_memory_enabled is False
+    assert status_code == 0
+    assert "enabled=false" in status.out
+    assert "entrypoint_exists=false" in status.out
+    assert "NOTES.md" in status.out
+    assert write_code == 0
+    assert read_code == 0
+    assert read.out == "custom index"
+
+
+def test_settings_debug_defaults_drive_debug_outputs(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """debug.provider in settings behaves like --debug-provider without requiring credentials."""
+    repo = _repo(tmp_path)
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(
+        json.dumps({"provider": {"type": "openai-chat", "model": "gpt-test"}, "debug": {"provider": True}}),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--cwd", str(repo), "--config-home", str(tmp_path / ".claude")])
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert payload["type"] == "openai-chat"
+    assert payload["model"] == "gpt-test"
+    assert payload["credentials"] == "missing"
+
+
+def test_settings_mcp_timeouts_pass_to_config_loader(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """mcp.startupTimeout/toolTimeout in settings are passed to local stdio config loading."""
+    repo = _repo(tmp_path)
+    mcp_config = repo / "mcp.json"
+    mcp_config.write_text(json.dumps({"mcpServers": {"fake": {"command": "python3", "args": ["server.py"]}}}), encoding="utf-8")
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(
+        json.dumps({"mcp": {"configs": ["mcp.json"], "startupTimeout": 1.25, "toolTimeout": 2.5}}),
+        encoding="utf-8",
+    )
+    captured_calls: list[dict[str, object]] = []
+
+    def fake_load_mcp_config(path, *, cwd=None, startup_timeout_seconds=None, tool_timeout_seconds=None):
+        captured_calls.append(
+            {
+                "path": Path(path),
+                "cwd": cwd,
+                "startup_timeout_seconds": startup_timeout_seconds,
+                "tool_timeout_seconds": tool_timeout_seconds,
+            }
+        )
+        return ()
+
+    monkeypatch.setattr(local_agent, "load_mcp_config", fake_load_mcp_config)
+
+    exit_code = main(["mcp", "doctor", "--cwd", str(repo), "--config-home", str(tmp_path / ".claude")])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "mcp ok (0 servers)" in captured.out
+    assert captured_calls == [
+        {
+            "path": mcp_config,
+            "cwd": repo,
+            "startup_timeout_seconds": 1.25,
+            "tool_timeout_seconds": 2.5,
+        }
+    ]
+
+
+def test_cli_management_aliases_for_config_doctor_and_effective_config(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Subcommand-style aliases map to the same non-mutating config diagnostics."""
+    repo = _repo(tmp_path)
+    (repo / DEFAULT_LOCAL_CONFIG_NAME).write_text(json.dumps({"runner": {"permissionMode": "bypass"}}), encoding="utf-8")
+
+    doctor_code = main(["config", "doctor", "--cwd", str(repo)])
+    doctor = capsys.readouterr()
+    effective_code = main(["config", "effective", "--cwd", str(repo)])
+    effective = capsys.readouterr()
+
+    assert doctor_code == 0
+    assert "permission_mode=bypass" in doctor.out
+    assert effective_code == 0
+    assert json.loads(effective.out)["runner"]["permissionMode"] == "bypass"
+
+
+def test_build_local_engine_uses_provider_env_without_global_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runner config/env can select a provider without mutating process env."""
+    monkeypatch.delenv("AGENT_KERNEL_PROVIDER", raising=False)
+    provider_env = {
+        "AGENT_KERNEL_PROVIDER": "openai-chat",
+        "AGENT_KERNEL_API_KEY": "test-key",
+        "AGENT_KERNEL_MODEL": "gpt-test",
+    }
+
+    engine = build_local_engine(
+        cwd=_repo(tmp_path),
+        config_home=tmp_path / ".claude",
+        provider_env=provider_env,
+    )
+
+    assert isinstance(engine.model_provider, OpenAIChatModelProvider)
+    assert engine.model_provider.model == "gpt-test"
+    assert os.environ.get("AGENT_KERNEL_PROVIDER") is None
 
 
 def test_build_local_engine_uses_query_engine_and_safe_default_permissions(tmp_path: Path) -> None:
@@ -764,6 +1060,71 @@ Echo second.
         discover_local_skills(skills_root)
 
 
+def test_skills_multi_dir_validation_json_and_info_aliases(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """v0.5 skills commands support multiple dirs, JSON list output, validation, and info lookup."""
+    first = tmp_path / "skills-a"
+    second = tmp_path / "skills-b"
+    _write_skill(
+        first,
+        "echo",
+        """---
+name: echo
+description: Echo skill
+---
+Echo.
+""",
+    )
+    _write_skill(
+        second,
+        "summarize",
+        """---
+name: summarize
+description: Summarize skill
+---
+Summarize.
+""",
+    )
+
+    report = validate_local_skills((first, second))
+    assert [skill.name for skill in report.skills] == ["echo", "summarize"]
+
+    list_code = main(["skills", "list", "--skills-dir", str(first), "--skills-dir", str(second), "--json"])
+    listed = capsys.readouterr()
+    validate_code = main(["skills", "validate", "--skills-dir", str(first), "--skills-dir", str(second)])
+    validated = capsys.readouterr()
+    info_code = main(["skills", "info", "summarize", "--skills-dir", str(first), "--skills-dir", str(second)])
+    info = capsys.readouterr()
+
+    assert list_code == 0
+    assert [skill["name"] for skill in json.loads(listed.out)["skills"]] == ["echo", "summarize"]
+    assert validate_code == 0
+    assert "skills ok (2)" in validated.out
+    assert info_code == 0
+    assert json.loads(info.out)["name"] == "summarize"
+
+
+def test_skills_strict_validation_reports_fork_and_unknown_frontmatter(tmp_path: Path) -> None:
+    """Strict skill validation turns unsupported fork/extra frontmatter into clear errors."""
+    skills_root = tmp_path / "skills"
+    _write_skill(
+        skills_root,
+        "forked",
+        """---
+name: forked
+description: Forked
+context: fork
+extra-key: value
+---
+Forked.
+""",
+    )
+
+    report = validate_local_skills((skills_root,))
+    assert any("forked skills are not implemented" in warning for warning in report.warnings)
+    with pytest.raises(SkillsConfigurationError, match="context=fork"):
+        validate_local_skills((skills_root,), strict=True)
+
+
 def test_build_local_engine_loads_mcp_fixture(tmp_path: Path) -> None:
     """The runner can opt in to local-only MCP tools via mcp_fixture."""
     engine = build_local_engine(
@@ -971,6 +1332,121 @@ def test_memory_cli_read_write_status_and_path_safety(
     assert "Memory path must stay inside the project memory directory" in unsafe.err
 
 
+def test_memory_list_skips_symlink_escape(tmp_path: Path) -> None:
+    """Memory listing follows the same project-directory confinement as read/write."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    safe_file = write_memory_file("inside.md", "safe", cwd=repo, config_home=config_home)
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    symlink_path = safe_file.parent / "linked-outside.md"
+    try:
+        symlink_path.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is not available: {exc}")
+
+    files = list_memory_files(cwd=repo, config_home=config_home)
+    issues = validate_memory(cwd=repo, config_home=config_home)
+
+    assert {file["path"] for file in files} == {"inside.md"}
+    assert any("linked-outside.md" in issue and "escapes memory directory" in issue for issue in issues)
+
+
+def test_session_management_info_export_delete_aliases(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """Session management aliases expose metadata/export/delete without rewriting transcript rows."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+    engine = build_local_engine(
+        cwd=repo,
+        config_home=config_home,
+        model_provider=FakeModelProvider(["session response"]),
+        session_id="managed-session",
+        require_api_key=False,
+    )
+    asyncio.run(run_local_agent_once("hello session", engine=engine))
+
+    info_code = main(["sessions", "info", "managed-session", "--cwd", str(repo), "--config-home", str(config_home), "--json"])
+    info = capsys.readouterr()
+    export_code = main(["sessions", "export", "managed-session", "--cwd", str(repo), "--config-home", str(config_home)])
+    exported = capsys.readouterr()
+    delete_without_yes = main(["sessions", "delete", "managed-session", "--cwd", str(repo), "--config-home", str(config_home)])
+    denied = capsys.readouterr()
+    delete_code = main(["sessions", "delete", "managed-session", "--cwd", str(repo), "--config-home", str(config_home), "--yes"])
+    deleted = capsys.readouterr()
+
+    payload = json.loads(info.out)
+    assert info_code == 0
+    assert payload["sessionId"] == "managed-session"
+    assert payload["messageCount"] == 2
+    assert payload["hasToolResultPairingIssues"] is False
+    assert export_code == 0
+    assert '"sessionId":"managed-session"' in exported.out
+    assert delete_without_yes == 2
+    assert "requires --yes" in denied.err
+    assert delete_code == 0
+    assert "deleted " in deleted.out
+
+
+def test_memory_management_list_remember_append_validate_and_delete_aliases(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """Memory management commands make explicit memory workflows usable."""
+    repo = _repo(tmp_path)
+    config_home = tmp_path / ".claude"
+
+    remember_code = main(
+        [
+            "memory",
+            "remember",
+            "--cwd",
+            str(repo),
+            "--config-home",
+            str(config_home),
+            "--memory-type",
+            "feedback",
+            "--memory-name",
+            "Terse Replies",
+            "--memory-text",
+            "Prefer terse engineering summaries.",
+        ]
+    )
+    remembered = capsys.readouterr()
+    list_code = main(["memory", "list", "--cwd", str(repo), "--config-home", str(config_home), "--json"])
+    listed = capsys.readouterr()
+    append_code = main(
+        [
+            "memory",
+            "append",
+            "feedback/terse-replies.md",
+            "--cwd",
+            str(repo),
+            "--config-home",
+            str(config_home),
+            "--memory-text",
+            "\nExtra note.",
+        ]
+    )
+    appended = capsys.readouterr()
+    validate_code = main(["memory", "validate", "--cwd", str(repo), "--config-home", str(config_home)])
+    validated = capsys.readouterr()
+    delete_code = main(["memory", "forget", "feedback/terse-replies.md", "--cwd", str(repo), "--config-home", str(config_home), "--yes"])
+    deleted = capsys.readouterr()
+
+    assert remember_code == 0
+    assert "remembered " in remembered.out
+    assert list_code == 0
+    listed_paths = [item["path"] for item in json.loads(listed.out)]
+    assert "MEMORY.md" in listed_paths
+    assert "feedback/terse-replies.md" in listed_paths
+    assert append_code == 0
+    assert "appended " in appended.out
+    assert validate_code == 0
+    assert "memory ok" in validated.out
+    assert delete_code == 0
+    assert "deleted " in deleted.out
+
+
 def test_build_local_engine_mcp_fixture_errors_are_clear(tmp_path: Path) -> None:
     """Missing or invalid MCP fixtures fail before model setup."""
     missing = tmp_path / "missing-mcp.json"
@@ -1015,6 +1491,41 @@ def test_cli_mcp_fixture_missing_returns_clear_error(capsys: pytest.CaptureFixtu
     assert exit_code == 2
     assert "MCP fixture does not exist" in captured.err
     assert captured.out == ""
+
+
+def test_mcp_management_list_and_doctor_aliases(capsys: pytest.CaptureFixture[str], tmp_path: Path) -> None:
+    """MCP management aliases inspect explicit local fixtures/configs without a model call."""
+    fixture = _example_mcp_fixture()
+
+    list_code = main(["mcp", "list", "--mcp-fixture", str(fixture), "--json"])
+    listed = capsys.readouterr()
+    doctor_code = main(["mcp", "doctor", "--mcp-fixture", str(fixture)])
+    doctored = capsys.readouterr()
+
+    assert list_code == 0
+    payload = json.loads(listed.out)
+    assert payload["servers"][0]["name"] == "local-echo"
+    assert "mcp__local-echo__echo" in payload["servers"][0]["tools"]
+    assert doctor_code == 0
+    assert "mcp ok (1 servers)" in doctored.out
+
+
+def test_build_local_engine_rejects_duplicate_mcp_clients(tmp_path: Path) -> None:
+    """Multiple MCP capability sources fail clearly if normalized server names collide."""
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    payload = {"name": "same", "tools": [{"name": "echo", "result": "ok"}]}
+    first.write_text(json.dumps(payload), encoding="utf-8")
+    second.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(Exception, match="collides"):
+        build_local_engine(
+            cwd=_repo(tmp_path),
+            config_home=tmp_path / ".claude",
+            model_provider=FakeModelProvider(["ok"]),
+            mcp_fixtures=(first, second),
+            require_api_key=False,
+        )
 
 
 def test_run_local_agent_once_sends_user_input_through_query_loop(tmp_path: Path) -> None:

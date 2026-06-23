@@ -382,7 +382,7 @@ def _decode_response(raw: bytes, content_type: str) -> str:
 
 def get_web_fetch_user_agent() -> str:
     """获取web fetch 用户 agent，供Web 工具流程使用。"""
-    return "Claude-User (claude-code-python-port; +https://support.anthropic.com/)"
+    return "AgentBase-User (agent-base; +https://github.com/RichFerry/agent-base)"
 
 
 def get_url_markdown_content(url: str) -> dict[str, Any]:

@@ -33,7 +33,7 @@ def test_prompt_composer_keeps_core_section_order_and_append(tmp_path: Path) -> 
 
     system_prompt, user_context, system_context = composer.fetch_system_prompt_parts(
         tools=tools,
-        model="claude-opus-4-6",
+        model="agent-kernel-frontier",
         append_system_prompt="APPENDED",
     )
 
@@ -66,7 +66,7 @@ def test_prompt_composer_dynamic_sections_follow_source_order(tmp_path: Path) ->
             enabled=True,
             system_prompt_suggest_summaries=True,
             keep_recent=5,
-            supported_models=("claude-opus",),
+            supported_models=("agent-kernel-frontier",),
         ),
         mcp_clients=(
             MCPClientConfig(name="github", instructions="Use pull request numbers exactly."),
@@ -79,7 +79,7 @@ def test_prompt_composer_dynamic_sections_follow_source_order(tmp_path: Path) ->
     (memory_dir / ENTRYPOINT_NAME).write_text("Remember the repo conventions.\n", encoding="utf-8")
     composer = PromptComposer(config, MemoryLoader(config))
 
-    system_prompt = composer.get_system_prompt(tools=[BashTool(), FileReadTool()], model="claude-opus-4-6")
+    system_prompt = composer.get_system_prompt(tools=[BashTool(), FileReadTool()], model="agent-kernel-frontier")
     boundary = system_prompt.index(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
     dynamic_tail = system_prompt[boundary + 1 :]
 
@@ -105,7 +105,7 @@ def test_prompt_composer_source_precise_tool_guidance_and_env_bool(tmp_path: Pat
 
     system_prompt = composer.get_system_prompt(
         tools=[BashTool(), FileReadTool(), FileWriteTool(), EditTool(), TodoWriteTool()],
-        model="claude-opus-4-6",
+        model="agent-kernel-frontier",
     )
     using_tools = next(section for section in system_prompt if section.startswith("# Using your tools"))
     env_info = next(section for section in system_prompt if section.startswith("# Environment"))
@@ -113,7 +113,7 @@ def test_prompt_composer_source_precise_tool_guidance_and_env_bool(tmp_path: Pat
 
     assert "Break down and manage your work with the TodoWrite tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed." in using_tools
     assert "Is a git repository: false" in env_info
-    assert "You are powered by the model named Opus 4.6. The exact model ID is claude-opus-4-6." in env_info
+    assert "You are powered by the model named frontier model. The exact model ID is agent-kernel-frontier." in env_info
     assert session_guidance is not None
     assert "Use the Agent tool with specialized agents when the task at hand matches the agent's description." in session_guidance
     assert "For simple, directed codebase searches (e.g. for a specific file/class/function) use the Glob or Grep directly." in session_guidance
@@ -131,7 +131,7 @@ def test_prompt_composer_preserves_ant_source_sections(tmp_path: Path) -> None:
     config.cwd.mkdir()
     composer = PromptComposer(config, MemoryLoader(config))
 
-    system_prompt = composer.get_system_prompt(tools=[BashTool(), FileReadTool()], model="claude-opus-4-6")
+    system_prompt = composer.get_system_prompt(tools=[BashTool(), FileReadTool()], model="agent-kernel-frontier")
 
     assert any("Default to writing no comments. Only add one when the WHY is non-obvious" in section for section in system_prompt)
     assert any(section.startswith("# Communicating with the user") for section in system_prompt)
@@ -150,7 +150,7 @@ def test_prompt_composer_mcp_delta_omits_mcp_instructions(tmp_path: Path) -> Non
     config.cwd.mkdir()
     composer = PromptComposer(config, MemoryLoader(config))
 
-    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="claude-opus-4-6")
+    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="agent-kernel-frontier")
 
     assert not any(section.startswith("# MCP Server Instructions") for section in system_prompt)
 
@@ -170,7 +170,7 @@ def test_prompt_composer_output_style_intro_section_and_coding_gate(tmp_path: Pa
     config.cwd.mkdir()
     composer = PromptComposer(config, MemoryLoader(config))
 
-    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="claude-opus-4-6")
+    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="agent-kernel-frontier")
     boundary = system_prompt.index(SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
     dynamic_tail = system_prompt[boundary + 1 :]
 
@@ -194,7 +194,7 @@ def test_prompt_composer_output_style_can_keep_coding_instructions(tmp_path: Pat
     config.cwd.mkdir()
     composer = PromptComposer(config, MemoryLoader(config))
 
-    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="claude-opus-4-6")
+    system_prompt = composer.get_system_prompt(tools=[BashTool()], model="agent-kernel-frontier")
 
     assert any(section.startswith("# Doing tasks") for section in system_prompt)
 
@@ -250,7 +250,7 @@ def test_fetch_system_prompt_parts_custom_prompt_skips_default_prompt(tmp_path: 
 
     system_prompt, user_context, system_context = composer.fetch_system_prompt_parts(
         tools=[BashTool()],
-        model="claude-opus-4-6",
+        model="agent-kernel-frontier",
         custom_system_prompt="CUSTOM",
         append_system_prompt="APPEND",
     )
@@ -261,7 +261,7 @@ def test_fetch_system_prompt_parts_custom_prompt_skips_default_prompt(tmp_path: 
 
     empty_custom_prompt, _, _ = composer.fetch_system_prompt_parts(
         tools=[BashTool()],
-        model="claude-opus-4-6",
+        model="agent-kernel-frontier",
         custom_system_prompt="",
         append_system_prompt="APPEND",
     )

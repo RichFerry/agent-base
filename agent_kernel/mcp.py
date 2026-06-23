@@ -33,10 +33,25 @@ from .tools.base import Tool, ToolResult, ToolUseContext, ValidationResult
 
 MAX_MCP_DESCRIPTION_LENGTH = 2_000
 MCP_CONFIG_ENV = "AGENT_KERNEL_MCP_CONFIG"
+MAX_MCP_STDERR_TAIL_CHARS = 4_000
+_SECRET_ENV_KEY_RE = re.compile(r"(api[_-]?key|token|secret|password|auth)", re.IGNORECASE)
+_SECRET_VALUE_RE = re.compile(r"\b(?:sk|ak|pk|rk)-[A-Za-z0-9_-]{8,}\b")
 
 
 class MCPConfigurationError(RuntimeError):
     """Raised when an MCP config cannot be loaded into connected clients."""
+
+
+def _redact_mcp_diagnostic(text: str, env: dict[str, str] | None) -> str:
+    """Redact obvious credentials before surfacing MCP process diagnostics."""
+    redacted = text
+    if env:
+        for key, value in env.items():
+            if not value or len(value) < 4:
+                continue
+            if _SECRET_ENV_KEY_RE.search(str(key)):
+                redacted = redacted.replace(value, "[REDACTED]")
+    return _SECRET_VALUE_RE.sub("[REDACTED]", redacted)
 
 
 def normalize_name_for_mcp(name: str) -> str:
@@ -106,15 +121,18 @@ class StdioMCPClient:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         timeout_seconds: float = 5.0,
+        startup_timeout_seconds: float | None = None,
     ) -> None:
         self.name = name
         self.command = command
         self.cwd = cwd
         self.env = env
         self.timeout_seconds = timeout_seconds
+        self.startup_timeout_seconds = startup_timeout_seconds if startup_timeout_seconds is not None else timeout_seconds
         self.process: subprocess.Popen[str] | None = None
         self.next_id = 1
         self.calls: list[dict[str, Any]] = []
+        self.stderr_tail = ""
 
     def start(self) -> None:
         """Start the configured local stdio process."""
@@ -131,7 +149,7 @@ class StdioMCPClient:
             bufsize=1,
         )
 
-    def request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def request(self, method: str, params: dict[str, Any] | None = None, *, timeout_seconds: float | None = None) -> Any:
         """Send one JSON-RPC request and wait for the matching response."""
         if self.process is None:
             self.start()
@@ -149,13 +167,18 @@ class StdioMCPClient:
             self.process.stdin.flush()
         except BrokenPipeError as exc:
             raise RuntimeError(f'MCP server "{self.name}" stdin closed.') from exc
+        timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         while True:
-            readable, _, _ = select.select([self.process.stdout], [], [], self.timeout_seconds)
+            readable, _, _ = select.select([self.process.stdout], [], [], timeout)
             if not readable:
-                raise TimeoutError(f'MCP server "{self.name}" did not answer {method}.')
+                self._capture_stderr_tail()
+                suffix = f" stderr={self.stderr_tail}" if self.stderr_tail else ""
+                raise TimeoutError(f'MCP server "{self.name}" did not answer {method}.{suffix}')
             line = self.process.stdout.readline()
             if not line:
-                raise RuntimeError(f'MCP server "{self.name}" exited before answering {method}.')
+                self._capture_stderr_tail()
+                suffix = f" stderr={self.stderr_tail}" if self.stderr_tail else ""
+                raise RuntimeError(f'MCP server "{self.name}" exited before answering {method}.{suffix}')
             try:
                 response = json.loads(line)
             except json.JSONDecodeError:
@@ -192,13 +215,14 @@ class StdioMCPClient:
                 "capabilities": {},
                 "clientInfo": {"name": "agent-kernel-local", "version": "0.4.0"},
             },
+            timeout_seconds=self.startup_timeout_seconds,
         )
         self.notify("notifications/initialized")
         return result if isinstance(result, dict) else {}
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return tools exposed by the server."""
-        result = self.request("tools/list", {})
+        result = self.request("tools/list", {}, timeout_seconds=self.startup_timeout_seconds)
         tools = result.get("tools") if isinstance(result, dict) else None
         if not isinstance(tools, list):
             raise RuntimeError(f'MCP server "{self.name}" returned no tools.')
@@ -207,7 +231,7 @@ class StdioMCPClient:
     def list_resources(self) -> list[dict[str, Any]]:
         """Return resources exposed by the server, or an empty list when unsupported."""
         try:
-            result = self.request("resources/list", {})
+            result = self.request("resources/list", {}, timeout_seconds=self.startup_timeout_seconds)
         except RuntimeError:
             return []
         resources = result.get("resources") if isinstance(result, dict) else None
@@ -244,6 +268,40 @@ class StdioMCPClient:
             process.kill()
             process.wait(timeout=2)
 
+    def _capture_stderr_tail(self) -> None:
+        process = self.process
+        if process is None or process.stderr is None:
+            return
+        fd = process.stderr.fileno()
+        try:
+            was_blocking = os.get_blocking(fd)
+        except OSError:
+            return
+        try:
+            os.set_blocking(fd, False)
+            chunks: list[str] = []
+            while True:
+                readable, _, _ = select.select([fd], [], [], 0)
+                if not readable:
+                    break
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk.decode("utf-8", errors="replace"))
+        except Exception:
+            return
+        finally:
+            try:
+                os.set_blocking(fd, was_blocking)
+            except OSError:
+                pass
+        if chunks:
+            diagnostic = _redact_mcp_diagnostic("".join(chunks), self.env)
+            self.stderr_tail = (self.stderr_tail + diagnostic)[-MAX_MCP_STDERR_TAIL_CHARS:]
+
 
 def _resolve_stdio_command(command: str, args: list[str]) -> list[str]:
     executable = sys.executable if command == "python3" else command
@@ -268,10 +326,17 @@ def _server_entries_from_config(payload: dict[str, Any]) -> dict[str, dict[str, 
         if not raw_servers:
             raise MCPConfigurationError("MCP config mcpServers must include at least one server.")
         servers: dict[str, dict[str, Any]] = {}
+        normalized_names: dict[str, str] = {}
         for name, config in raw_servers.items():
             server_name = str(name)
             if not isinstance(config, dict):
                 raise MCPConfigurationError(f'MCP server "{server_name}" config must be an object.')
+            normalized = normalize_name_for_mcp(server_name)
+            if normalized in normalized_names:
+                raise MCPConfigurationError(
+                    f'MCP server "{server_name}" collides with "{normalized_names[normalized]}" after name normalization.'
+                )
+            normalized_names[normalized] = server_name
             servers[server_name] = config
         return servers
     # Backward-compatible local smoke shape: {"name": "...", "command": "...", "args": [...]}
@@ -281,7 +346,43 @@ def _server_entries_from_config(payload: dict[str, Any]) -> dict[str, dict[str, 
     raise MCPConfigurationError("MCP config must include an mcpServers object.")
 
 
-def load_mcp_config(path: str | Path, *, cwd: str | Path | None = None) -> tuple[MCPClientConfig, ...]:
+def _positive_timeout(value: Any, *, label: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise MCPConfigurationError(f"{label} must be a positive number.")
+    return float(value)
+
+
+def _validate_mcp_tool_and_resource_names(server_name: str, tools: list[dict[str, Any]], resources: list[dict[str, Any]]) -> None:
+    seen_tools: dict[str, str] = {}
+    for tool in tools:
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            raise MCPConfigurationError(f'MCP server "{server_name}" returned a tool without a name.')
+        normalized = normalize_name_for_mcp(name)
+        if normalized in seen_tools:
+            raise MCPConfigurationError(
+                f'MCP server "{server_name}" tool "{name}" collides with "{seen_tools[normalized]}" after name normalization.'
+            )
+        seen_tools[normalized] = name
+    seen_resources: set[str] = set()
+    for resource in resources:
+        uri = str(resource.get("uri") or "").strip()
+        if not uri:
+            raise MCPConfigurationError(f'MCP server "{server_name}" returned a resource without a uri.')
+        if uri in seen_resources:
+            raise MCPConfigurationError(f'MCP server "{server_name}" returned duplicate resource uri "{uri}".')
+        seen_resources.add(uri)
+
+
+def load_mcp_config(
+    path: str | Path,
+    *,
+    cwd: str | Path | None = None,
+    startup_timeout_seconds: float | None = None,
+    tool_timeout_seconds: float | None = None,
+) -> tuple[MCPClientConfig, ...]:
     """Load local-only stdio MCP servers into connected MCPClientConfig objects."""
     config_path = Path(path).expanduser()
     if not config_path.exists():
@@ -294,6 +395,8 @@ def load_mcp_config(path: str | Path, *, cwd: str | Path | None = None) -> tuple
     started_clients: list[StdioMCPClient] = []
     try:
         for server_name, server_config in _server_entries_from_config(payload).items():
+            if server_config.get("disabled") is True:
+                continue
             server_type = str(server_config.get("type") or "stdio")
             if server_type != "stdio":
                 raise MCPConfigurationError(f'MCP server "{server_name}" uses unsupported type "{server_type}". Only local stdio is supported.')
@@ -307,18 +410,32 @@ def load_mcp_config(path: str | Path, *, cwd: str | Path | None = None) -> tuple
             if not isinstance(raw_env, dict):
                 raise MCPConfigurationError(f'MCP server "{server_name}" env must be an object.')
             server_cwd = Path(server_config["cwd"]).expanduser() if server_config.get("cwd") else base_cwd
+            default_startup_timeout = startup_timeout_seconds if startup_timeout_seconds is not None else tool_timeout_seconds
+            startup_timeout = _positive_timeout(
+                server_config.get("startupTimeout", server_config.get("toolTimeout", default_startup_timeout)),
+                label=f'MCP server "{server_name}" startup timeout',
+                default=5.0,
+            )
+            tool_timeout = _positive_timeout(
+                server_config.get("toolTimeout", tool_timeout_seconds),
+                label=f'MCP server "{server_name}" timeout',
+                default=startup_timeout,
+            )
             env = {**os.environ, **{str(key): str(value) for key, value in raw_env.items()}}
             client = StdioMCPClient(
                 name=server_name,
                 command=_resolve_stdio_command(command, [str(arg) for arg in raw_args]),
                 cwd=server_cwd,
                 env=env,
+                timeout_seconds=tool_timeout,
+                startup_timeout_seconds=startup_timeout,
             )
             client.start()
             started_clients.append(client)
             client.initialize()
             tools = client.list_tools()
             resources = client.list_resources()
+            _validate_mcp_tool_and_resource_names(server_name, tools, resources)
             clients.append(
                 MCPClientConfig(
                     name=server_name,

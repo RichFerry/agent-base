@@ -43,7 +43,7 @@ agent-kernel-local --help
 Package facts:
 
 - Package name: `agent-kernel`
-- Current version: `0.4.0`
+- Current version: `0.5.0`
 - Python: `>=3.11`
 - Runtime dependencies: none
 
@@ -137,10 +137,16 @@ Common commands:
 ```bash
 agent-kernel-local --permission-mode ask "Summarize this project in one sentence."
 agent-kernel-local --repl
+agent-kernel-local --init-config
+agent-kernel-local --doctor
+agent-kernel-local config doctor
+agent-kernel-local config effective
 agent-kernel-local --list-sessions
+agent-kernel-local sessions list
 agent-kernel-local --resume SESSION_ID "Continue from here."
 agent-kernel-local --continue "Continue the latest local session."
 agent-kernel-local --memory-status
+agent-kernel-local memory list
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
 ```
@@ -149,6 +155,38 @@ Permission modes:
 
 - `ask`: default. Tool calls that need approval are denied unless a callback or hook grants permission.
 - `bypass`: explicit local verification mode. Structural path and safety checks still apply.
+
+### Local Config
+
+v0.5.0 uses `settings.json` as the official local runner config file:
+
+```bash
+agent-kernel-local --init-config
+agent-kernel-local --doctor
+agent-kernel-local --print-effective-config
+```
+
+Discovery order is user settings, project settings, then explicit
+`--agent-config`; higher-precedence layers override lower ones. CLI flags and
+`AGENT_KERNEL_*` environment variables override settings. API keys still come
+only from environment variables.
+
+Supported non-secret defaults include provider type/model/base URL, permission
+mode, max turns, WebSearch/WebFetch opt-ins, Skills directories, MCP
+fixture/config paths, session defaults, memory defaults, and debug flags.
+
+Example:
+
+```json
+{
+  "provider": {"type": "anthropic", "model": "", "baseUrl": ""},
+  "runner": {"permissionMode": "ask", "maxTurns": 10},
+  "skills": {"dirs": ["examples/skills"], "discoveryMode": "explicit"},
+  "mcp": {"configs": ["examples/mcp/stdio-config.json"]}
+}
+```
+
+Do not store API keys, tokens, passwords, or secrets in `settings.json`.
 
 ## Optional Capabilities
 
@@ -208,7 +246,14 @@ Inspect local skills without calling a model:
 
 ```bash
 agent-kernel-local --skills-dir examples/skills --list-skills
+agent-kernel-local skills list --skills-dir examples/skills --json
+agent-kernel-local skills validate --skills-dir examples/skills
+agent-kernel-local skills info echo --skills-dir examples/skills
 ```
+
+Multiple `--skills-dir` values are supported. Runner discovery is explicit by
+default; ambient skill discovery is available only when configured. Forked
+skills are still reported as not implemented.
 
 ### MCP Fixture
 
@@ -231,24 +276,38 @@ agent-kernel-local \
   "Call the stdio echo MCP tool with hello."
 ```
 
-The v0.4 config loader supports local-only stdio servers shaped as
+The v0.5.0 config loader supports local-only stdio servers shaped as
 `mcpServers.{name}.command`, `args`, `env`, and optional `cwd`. It uses stdlib
 JSON-RPC over stdio and does not support remote MCP, OAuth, SSE, or default
 third-party server startup.
+
+v0.5.0 adds management diagnostics:
+
+```bash
+agent-kernel-local mcp list --mcp-fixture examples/mcp/echo-mcp.json --json
+agent-kernel-local mcp doctor --mcp-config examples/mcp/stdio-config.json
+agent-kernel-local mcp validate-config examples/mcp/stdio-config.json
+```
 
 ### Sessions and Memory
 
 ```bash
 agent-kernel-local --list-sessions
+agent-kernel-local sessions info SESSION_ID --json
+agent-kernel-local sessions export SESSION_ID
+agent-kernel-local sessions delete SESSION_ID --yes
 agent-kernel-local --resume SESSION_ID "Continue this session."
 agent-kernel-local --continue "Continue the latest session."
 agent-kernel-local --memory-status
+agent-kernel-local memory list --json
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
+agent-kernel-local memory remember --memory-type feedback --memory-name "Terse Replies" --memory-text "Prefer terse engineering summaries."
+agent-kernel-local memory validate
 ```
 
 Resume reads existing JSONL transcript ordering through `SessionStore`. Memory
-writes are explicit only; there is no automatic memory extraction in v0.4.
+management is explicit only; there is no automatic memory extraction in v0.5.
 Memory paths must be relative and stay inside the project memory directory.
 
 ### Combined Local Smoke
@@ -385,12 +444,18 @@ See `docs/smoke-v0.3.md` for setup and safety details.
 - `READING_GUIDE.md`: suggested source reading order.
 - `docs/release-v0.3.md`: v0.3 release summary and readiness notes.
 - `docs/release-v0.4.md`: v0.4 local CLI readiness notes.
+- `docs/config-v0.5.md`: v0.5 local settings and doctor notes.
+- `docs/skills-v0.5.md`: v0.5 Skills management notes.
+- `docs/session-memory-v0.5.md`: v0.5 session and memory management notes.
+- `docs/mcp-v0.5.md`: v0.5 local MCP config hardening notes.
+- `docs/cli-v0.5.md`: v0.5 local CLI daily-use notes.
+- `docs/release-v0.5.md`: v0.5 release readiness notes.
 - `docs/smoke-v0.3.md`: manual real smoke setup.
 - `CHANGELOG.md`: release changelog.
 
 ## Project Status
 
-Current release: `v0.4.0`.
+Current release: `v0.5.0`.
 
 This repository is a kernel and example runner for local experimentation and
 extension. It is designed to keep behavior observable and testable before adding

@@ -8,7 +8,7 @@ pattern 并按 mtime 排序；Grep 编译正则，支持 content、files_with_ma
 offset/limit/truncation，防止大型仓库把无限结果灌入上下文。路径显示尽量相对 cwd，
 但权限和真实读取始终使用规范绝对路径。
 
-实现使用标准库以保持包零依赖；它追求 Claude Code 工具协议和输出形状，不试图替代
+实现使用标准库以保持包零依赖；它追求 Agent Base 工具协议和输出形状，不试图替代
 完整 ripgrep 的所有语法优化。
 """
 

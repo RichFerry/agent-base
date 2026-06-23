@@ -200,6 +200,90 @@ def test_mcp_stdio_config_invalid_path_and_type_are_clear(tmp_path: Path) -> Non
         load_mcp_config(invalid, cwd=tmp_path)
 
 
+def test_mcp_stdio_config_rejects_normalized_server_collision(tmp_path: Path) -> None:
+    """Server names that normalize to the same MCP prefix fail before startup."""
+    config_path = tmp_path / "collision.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "same name": {"command": "python3", "args": ["server.py"]},
+                    "same_name": {"command": "python3", "args": ["server.py"]},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MCPConfigurationError, match="collides"):
+        load_mcp_config(config_path, cwd=tmp_path)
+
+
+def test_mcp_stdio_config_disabled_servers_do_not_start(tmp_path: Path) -> None:
+    """Disabled local MCP servers are ignored without starting their command."""
+    config_path = tmp_path / "disabled.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"disabled": {"disabled": True, "command": "python3", "args": ["missing.py"]}}}),
+        encoding="utf-8",
+    )
+
+    assert load_mcp_config(config_path, cwd=tmp_path) == ()
+
+
+def test_mcp_stdio_config_rejects_invalid_timeout(tmp_path: Path) -> None:
+    """Timeout values are validated before constructing a stdio client."""
+    config_path = tmp_path / "timeout.json"
+    config_path.write_text(
+        json.dumps({"mcpServers": {"bad-timeout": {"command": "python3", "args": ["server.py"], "toolTimeout": 0}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MCPConfigurationError, match="positive number"):
+        load_mcp_config(config_path, cwd=tmp_path)
+
+
+def test_mcp_stdio_timeout_stderr_diagnostics_are_bounded_and_redacted(tmp_path: Path) -> None:
+    """Timeout diagnostics include useful stderr without leaking env secrets."""
+    server = tmp_path / "stderr_server.py"
+    server.write_text(
+        "\n".join(
+            [
+                "import os",
+                "import sys",
+                "import time",
+                "sys.stderr.write(os.environ.get('AUTH_TOKEN', ''))",
+                "sys.stderr.flush()",
+                "time.sleep(0.3)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "stderr-config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "noisy": {
+                        "command": "python3",
+                        "args": [str(server)],
+                        "env": {"AUTH_TOKEN": "secret-token"},
+                        "toolTimeout": 0.05,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        load_mcp_config(config_path, cwd=tmp_path)
+
+    message = str(excinfo.value)
+    assert "stderr=" in message
+    assert "[REDACTED]" in message
+    assert "secret-token" not in message
+
+
 def test_mcp_tool_use_executes_handler_and_returns_tool_result(tmp_path: Path) -> None:
     """验证 ``mcp tool use executes handler and returns tool result`` 场景的行为、消息形状和关键不变量。"""
     calls = []

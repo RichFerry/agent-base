@@ -90,7 +90,7 @@ def test_system_init_message_uses_source_shaped_fields(tmp_path: Path) -> None:
         config=config,
         session_id="session-1",
         tools=[BashTool(), FileReadTool()],
-        model="claude-opus-4-6",
+        model="agent-kernel-frontier",
     )
     engine.tool_use_context.app_state.tool_permission_context.mode = "bypass"
 
@@ -103,7 +103,7 @@ def test_system_init_message_uses_source_shaped_fields(tmp_path: Path) -> None:
     assert init["session_id"] == "session-1"
     assert init["tools"] == ["Bash", "Read"]
     assert init["mcp_servers"] == [{"name": "github", "status": "connected"}]
-    assert init["model"] == "claude-opus-4-6"
+    assert init["model"] == "agent-kernel-frontier"
     assert init["permissionMode"] == "bypass"
     assert init["slash_commands"] == []
     assert init["apiKeySource"] == "none"

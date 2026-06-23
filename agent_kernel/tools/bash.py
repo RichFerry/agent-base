@@ -446,7 +446,7 @@ class BashTool(Tool):
         redirection_paths = _extract_output_redirections(command)
         if redirection_paths and _compound_command_has_cd(command):
             return PermissionDecision.ask(
-                "Commands that change directories and write via output redirection require explicit approval to ensure paths are evaluated correctly. For security, Claude Code cannot automatically determine the final working directory when 'cd' is used in compound commands.",
+                "Commands that change directories and write via output redirection require explicit approval to ensure paths are evaluated correctly. For security, Agent Base cannot automatically determine the final working directory when 'cd' is used in compound commands.",
                 bypass_immune=True,
             )
         path_operations = _extract_path_command_operations(command)

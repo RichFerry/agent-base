@@ -27,7 +27,7 @@ def test_pyproject_packaging_metadata_contract() -> None:
 
     assert pyproject["build-system"]["requires"] == ["setuptools>=61", "wheel"]
     assert project["name"] == "agent-kernel"
-    assert project["version"] == "0.4.0"
+    assert project["version"] == "0.5.0"
     assert "agent kernel" in project["description"].lower()
     assert project["requires-python"] == ">=3.11"
     assert project["dependencies"] == []

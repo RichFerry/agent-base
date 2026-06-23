@@ -1819,7 +1819,7 @@ def test_anthropic_provider_uses_x_api_key_when_no_auth_token() -> None:
         transport=transport,
     )
 
-    response = asyncio.run(_collect(provider.stream(messages=[], system_prompt=[], tools=[], options={"model": "claude-opus-4-6"})))
+    response = asyncio.run(_collect(provider.stream(messages=[], system_prompt=[], tools=[], options={"model": "agent-kernel-frontier"})))
 
     assert captured["headers"]["x-api-key"] == "api-key"
     assert "Authorization" not in captured["headers"]
@@ -2101,6 +2101,21 @@ def test_build_model_provider_from_env_selects_openai_without_leaking_key(monkey
     assert isinstance(provider, OpenAIChatModelProvider)
     assert provider.model == "gpt-test"
     assert provider.api_key == "secret-openai-key"
+
+
+def test_build_model_provider_from_env_applies_provider_runtime_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """settings.json provider timeout/maxTokens flow through env into provider constructors."""
+    monkeypatch.setenv("AGENT_KERNEL_PROVIDER", "anthropic")
+    monkeypatch.setenv("AGENT_KERNEL_API_KEY", "secret-anthropic-key")
+    monkeypatch.setenv("AGENT_KERNEL_MODEL", "claude-test")
+    monkeypatch.setenv("AGENT_KERNEL_TIMEOUT", "7.5")
+    monkeypatch.setenv("AGENT_KERNEL_MAX_TOKENS", "1234")
+
+    provider = build_model_provider_from_env(require_credentials=True)
+
+    assert isinstance(provider, AnthropicModelProvider)
+    assert provider.timeout == 7.5
+    assert provider.max_tokens == 1234
 
 
 async def _collect(aiter):

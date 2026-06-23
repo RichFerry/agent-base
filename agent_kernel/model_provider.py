@@ -67,6 +67,46 @@ class OpenAIAPIError(RuntimeError):
     pass
 
 
+def _positive_float_env(name: str, *, error_cls: type[RuntimeError]) -> float | None:
+    """Read an optional positive float from env for provider construction."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError as exc:
+        raise error_cls(f"{name} must be a positive number.") from exc
+    if parsed <= 0:
+        raise error_cls(f"{name} must be a positive number.")
+    return parsed
+
+
+def _positive_int_env(name: str, *, error_cls: type[RuntimeError]) -> int | None:
+    """Read an optional positive integer from env for provider construction."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise error_cls(f"{name} must be a positive integer.") from exc
+    if parsed <= 0:
+        raise error_cls(f"{name} must be a positive integer.")
+    return parsed
+
+
+def _provider_options_from_env(error_cls: type[RuntimeError]) -> dict[str, Any]:
+    """Return provider constructor overrides shared by local settings and env."""
+    options: dict[str, Any] = {}
+    timeout = _positive_float_env("AGENT_KERNEL_TIMEOUT", error_cls=error_cls)
+    if timeout is not None:
+        options["timeout"] = timeout
+    max_tokens = _positive_int_env("AGENT_KERNEL_MAX_TOKENS", error_cls=error_cls)
+    if max_tokens is not None:
+        options["max_tokens"] = max_tokens
+    return options
+
+
 def _endpoint_from_base_url(base_url: str) -> str:
     """完成 ``_endpoint_from_base_url`` 对应的模型调用内部步骤。"""
     normalized = base_url.rstrip("/")
@@ -440,6 +480,7 @@ class AnthropicModelProvider:
             auth_token=os.environ.get("ANTHROPIC_AUTH_TOKEN"),
             api_key=os.environ.get("ANTHROPIC_API_KEY"),
             model=os.environ.get("ANTHROPIC_MODEL"),
+            **_provider_options_from_env(AnthropicAPIError),
         )
 
     def __post_init__(self) -> None:
@@ -447,7 +488,7 @@ class AnthropicModelProvider:
         self.base_url = self.base_url or os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
         self.auth_token = self.auth_token if self.auth_token is not None else os.environ.get("ANTHROPIC_AUTH_TOKEN")
         self.api_key = self.api_key if self.api_key is not None else os.environ.get("ANTHROPIC_API_KEY")
-        self.model = self.model or os.environ.get("ANTHROPIC_MODEL") or "claude-opus-4-6"
+        self.model = self.model or os.environ.get("ANTHROPIC_MODEL") or "agent-kernel-frontier"
 
     async def stream(
         self,
@@ -581,6 +622,7 @@ class OpenAIChatModelProvider:
             base_url=os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com",
             api_key=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"),
             model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL"),
+            **_provider_options_from_env(OpenAIAPIError),
         )
 
     def __post_init__(self) -> None:
@@ -760,6 +802,7 @@ class OpenAIResponsesModelProvider:
             base_url=os.environ.get("AGENT_KERNEL_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com",
             api_key=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"),
             model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("OPENAI_MODEL"),
+            **_provider_options_from_env(OpenAIAPIError),
         )
 
     def __post_init__(self) -> None:
@@ -964,6 +1007,7 @@ def build_model_provider_from_env(*, require_credentials: bool = False) -> Model
             auth_token=os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"),
             api_key=os.environ.get("ANTHROPIC_API_KEY"),
             model=os.environ.get("AGENT_KERNEL_MODEL") or os.environ.get("ANTHROPIC_MODEL"),
+            **_provider_options_from_env(AnthropicAPIError),
         )
     if provider_name == "openai-chat":
         has_credentials = bool(os.environ.get("AGENT_KERNEL_API_KEY") or os.environ.get("OPENAI_API_KEY"))

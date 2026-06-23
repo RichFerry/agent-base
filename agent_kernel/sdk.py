@@ -1,4 +1,4 @@
-"""内部消息与 Claude Code SDK 外围事件之间的纯映射层。
+"""内部消息与 SDK 外围事件之间的纯映射层。
 
 输入是 kernel Message 或 SDK-shaped dict，输出始终是新 dict；这里不访问模型、工具、
 session 文件或全局状态。主要能力包括：
@@ -39,7 +39,7 @@ def _now_iso() -> str:
 
 
 def sdk_compat_tool_name(name: str) -> str:
-    # Claude Code keeps emitting the legacy SDK wire name for the Agent tool.
+    # Keep emitting the legacy SDK wire name for the Agent tool.
     """完成 ``sdk_compat_tool_name`` 对应的SDK 映射内部步骤。"""
     return "Task" if name == "Agent" else name
 

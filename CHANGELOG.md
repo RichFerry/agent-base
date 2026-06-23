@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0
+
+- Added layered `settings.json` local runner settings with secret rejection, redacted doctor output, and effective config diagnostics.
+- Added daily-use CLI management aliases for config, skills, sessions, memory, and MCP.
+- Added multi-directory Skills loading, validation, JSON listing, strict validation, and skill info commands.
+- Added session info/export/delete/transcript-path commands while preserving JSONL resume ordering.
+- Added explicit memory list/append/remember/forget/delete/validate commands with path safety.
+- Hardened local MCP config loading with multiple configs, disabled servers, name collision checks, timeout validation, and bounded stderr diagnostics.
+- Added v0.5 docs for settings, skills, session/memory, MCP, CLI, and release readiness.
+
 ## 0.4.0
 
 - Added provider selection for Anthropic-compatible Messages, OpenAI Chat Completions, and OpenAI Responses while keeping `ModelProvider.stream(...)` as the internal kernel interface.

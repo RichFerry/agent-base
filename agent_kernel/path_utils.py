@@ -1,7 +1,7 @@
 """无策略的路径基础工具：展开、sanitize、git root 与 mtime。
 
 ``expand_path`` 处理 ``~``、环境变量和相对路径；``sanitize_path`` 把绝对项目路径编码
-为 Claude Code projects 目录使用的稳定键；``find_git_root`` 从给定目录向上寻找
+为 project store 目录使用的稳定键；``find_git_root`` 从给定目录向上寻找
 ``.git``。``file_mtime_ms`` 为 Read/Edit 和 compact 文件恢复提供毫秒时间戳。
 
 本模块只做机械转换，不判断路径能否读写，也不处理敏感文件。所有安全策略集中在
@@ -21,7 +21,7 @@ def expand_path(path: str | Path) -> Path:
 
 
 def sanitize_path(path: str | Path) -> str:
-    """把绝对路径变为 Claude Code projects 目录使用的稳定键。"""
+    """把绝对路径变为 project store 目录使用的稳定键。"""
     raw = str(Path(path).expanduser())
     raw = raw.replace("\\", "/")
     raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")

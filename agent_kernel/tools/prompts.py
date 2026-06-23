@@ -4,7 +4,7 @@
 模型应何时使用工具、参数限制、并发建议、git/PR 规则、timeout 和大输出处理，因此是
 tool protocol 的一部分，不是普通帮助文档。
 
-正文按 Claude Code 源码保留；测试会检查关键段落和顺序。可以补充 Python 注释或调整
+正文按上游工具协议保留；测试会检查关键段落和顺序。可以补充 Python 注释或调整
 函数内部组织，但不要润色英文、改变换行/bullet，或把动态 timeout/attribution 提前
 写死。真正的 schema 来自各 Tool.input_schema，提示词不能替代运行时校验。
 """
@@ -26,7 +26,7 @@ Usage:
 - By default, it reads up to {MAX_LINES_TO_READ} lines starting from the beginning of the file
 - You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
 - Results are returned using cat -n format, with line numbers starting at 1
-- This tool allows Claude Code to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Claude Code is a multimodal LLM.
+- This tool allows the agent to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as multimodal model input.
 - This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.
 - This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.
 - This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.

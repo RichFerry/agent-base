@@ -42,7 +42,7 @@ agent-kernel-local --help
 包信息：
 
 - 包名：`agent-kernel`
-- 当前版本：`0.4.0`
+- 当前版本：`0.5.0`
 - Python 版本：`>=3.11`
 - 运行时依赖：无
 
@@ -133,10 +133,16 @@ user input
 ```bash
 agent-kernel-local --permission-mode ask "Summarize this project in one sentence."
 agent-kernel-local --repl
+agent-kernel-local --init-config
+agent-kernel-local --doctor
+agent-kernel-local config doctor
+agent-kernel-local config effective
 agent-kernel-local --list-sessions
+agent-kernel-local sessions list
 agent-kernel-local --resume SESSION_ID "Continue from here."
 agent-kernel-local --continue "Continue the latest local session."
 agent-kernel-local --memory-status
+agent-kernel-local memory list
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
 ```
@@ -145,6 +151,34 @@ agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer conc
 
 - `ask`：默认模式。需要授权的工具调用，如果没有 callback 或 hook 批准，会被拒绝。
 - `bypass`：显式本地验证模式。路径和结构性安全检查仍然生效。
+
+### 本地 Config
+
+v0.5.0 使用 `settings.json` 作为官方本地 runner 配置文件：
+
+```bash
+agent-kernel-local --init-config
+agent-kernel-local --doctor
+agent-kernel-local --print-effective-config
+```
+
+发现顺序是用户 settings、项目 settings、显式 `--agent-config`；高优先级层覆盖低优先级层。
+CLI 参数和 `AGENT_KERNEL_*` 环境变量会覆盖 settings。API key 仍然只能从环境变量读取。
+
+可配置的非 secret 默认值包括 provider 类型/model/base URL、permission mode、max turns、
+WebSearch/WebFetch opt-in、Skills 目录、MCP fixture/config 路径、session 默认行为、
+memory 默认行为，以及 debug flags。
+
+```json
+{
+  "provider": {"type": "anthropic", "model": "", "baseUrl": ""},
+  "runner": {"permissionMode": "ask", "maxTurns": 10},
+  "skills": {"dirs": ["examples/skills"], "discoveryMode": "explicit"},
+  "mcp": {"configs": ["examples/mcp/stdio-config.json"]}
+}
+```
+
+不要把 API key、token、password 或其它 secret 写进 `settings.json`。
 
 ## 可选能力
 
@@ -203,7 +237,13 @@ agent-kernel-local \
 
 ```bash
 agent-kernel-local --skills-dir examples/skills --list-skills
+agent-kernel-local skills list --skills-dir examples/skills --json
+agent-kernel-local skills validate --skills-dir examples/skills
+agent-kernel-local skills info echo --skills-dir examples/skills
 ```
+
+支持多个 `--skills-dir`。Runner 默认使用显式 discovery；ambient discovery 只有在
+settings 中明确开启时才启用。Forked skills 仍然明确返回 not implemented。
 
 ### MCP Fixture
 
@@ -226,23 +266,37 @@ agent-kernel-local \
   "Call the stdio echo MCP tool with hello."
 ```
 
-v0.4 config loader 支持本地 stdio server，格式为
+v0.5.0 config loader 支持本地 stdio server，格式为
 `mcpServers.{name}.command`、`args`、`env` 和可选 `cwd`。它用标准库在 stdio
 上跑 JSON-RPC，不支持 remote MCP、OAuth、SSE，默认也不会启动第三方 server。
+
+v0.5.0 增加了管理诊断：
+
+```bash
+agent-kernel-local mcp list --mcp-fixture examples/mcp/echo-mcp.json --json
+agent-kernel-local mcp doctor --mcp-config examples/mcp/stdio-config.json
+agent-kernel-local mcp validate-config examples/mcp/stdio-config.json
+```
 
 ### Session 与 Memory
 
 ```bash
 agent-kernel-local --list-sessions
+agent-kernel-local sessions info SESSION_ID --json
+agent-kernel-local sessions export SESSION_ID
+agent-kernel-local sessions delete SESSION_ID --yes
 agent-kernel-local --resume SESSION_ID "Continue this session."
 agent-kernel-local --continue "Continue the latest session."
 agent-kernel-local --memory-status
+agent-kernel-local memory list --json
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
+agent-kernel-local memory remember --memory-type feedback --memory-name "Terse Replies" --memory-text "Prefer terse engineering summaries."
+agent-kernel-local memory validate
 ```
 
 Resume 通过 `SessionStore` 读取已有 JSONL transcript 顺序。Memory 写入必须显式触发；
-v0.4 不做自动 memory extraction。Memory 路径必须是相对路径，并且只能位于项目
+v0.5 不做自动 memory extraction。Memory 路径必须是相对路径，并且只能位于项目
 memory 目录内。
 
 ### 组合本地 Smoke
@@ -377,12 +431,18 @@ AGENT_KERNEL_RUN_REAL_MCP_SMOKE=1 python3 -m pytest tests/test_real_mcp_smoke.py
 - `READING_GUIDE.md`：推荐源码阅读顺序。
 - `docs/release-v0.3.md`：v0.3 release 摘要与 readiness 说明。
 - `docs/release-v0.4.md`：v0.4 本地 CLI readiness 说明。
+- `docs/config-v0.5.md`：v0.5 本地 settings 与 doctor 说明。
+- `docs/skills-v0.5.md`：v0.5 Skills 管理说明。
+- `docs/session-memory-v0.5.md`：v0.5 session 与 memory 管理说明。
+- `docs/mcp-v0.5.md`：v0.5 本地 MCP config hardening 说明。
+- `docs/cli-v0.5.md`：v0.5 本地 CLI 日常使用说明。
+- `docs/release-v0.5.md`：v0.5 release readiness 说明。
 - `docs/smoke-v0.3.md`：手动真实 smoke 配置。
 - `CHANGELOG.md`：发布变更记录。
 
 ## 项目状态
 
-当前 release：`v0.4.0`。
+当前 release：`v0.5.0`。
 
 本仓库是用于本地实验和扩展的 kernel 与 example runner。它的目标是在加入更大产品外壳之前，
 保持行为可观察、可测试。

@@ -121,7 +121,7 @@ class ToolUseContext:
 
 
 class Tool:
-    """Claude Code-style 工具协议的 Python 基类。"""
+    """Agent Base-style 工具协议的 Python 基类。"""
     name: str = ""
     aliases: tuple[str, ...] = ()
     search_hint: str | None = None

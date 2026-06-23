@@ -99,7 +99,7 @@ class QueryEngine:
     tools: list[Tool] = field(default_factory=default_tools)
     # session_id 同时决定 transcript 文件名和 SDK 事件关联键。
     session_id: str = field(default_factory=lambda: str(uuid4()))
-    model: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-6"))
+    model: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_MODEL", "agent-kernel-frontier"))
     # 这是跨 submit 的有效消息历史，不包含 progress 等瞬时事件。
     mutable_messages: list[Message] = field(default_factory=list)
     # UI/应用层通过 callback 完成 ask；内核本身不实现交互界面。

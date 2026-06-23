@@ -26,11 +26,11 @@ from .path_utils import is_git_repo
 from .skills import SKILL_TOOL_NAME, get_skill_system_reminder, load_skills
 
 SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
-FRONTIER_MODEL_NAME = "Claude Opus 4.6"
-CLAUDE_4_5_OR_4_6_MODEL_IDS = {
-    "opus": "claude-opus-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
+FRONTIER_MODEL_NAME = "frontier model"
+GENERIC_MODEL_IDS = {
+    "frontier": "agent-kernel-frontier",
+    "balanced": "agent-kernel-balanced",
+    "fast": "agent-kernel-fast",
 }
 CYBER_RISK_INSTRUCTION = "IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases."
 
@@ -168,8 +168,8 @@ def get_simple_doing_tasks_section(user_type: str = "external") -> str:
             ]
         )
     user_help_subitems = [
-        "/help: Get help with using Claude Code",
-        "To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
+        "/help: Get help with using Agent Base",
+        "To give feedback, users should report the issue in the project issue tracker.",
     ]
     items: list[str | list[str]] = [
         'The user will primarily request you to perform software engineering tasks. These may include solving bugs, adding new functionality, refactoring code, explaining code, and more. When given an unclear or generic instruction, consider it in the context of these software engineering tasks and the current working directory. For example, if the user asks you to change "methodName" to snake case, do not reply with just "method_name", instead find the method in the code and modify the code.',
@@ -183,7 +183,7 @@ def get_simple_doing_tasks_section(user_type: str = "external") -> str:
         *code_style_subitems,
         "Avoid backwards-compatibility hacks like renaming unused _vars, re-exporting types, adding // removed comments for removed code, etc. If you are certain that something is unused, you can delete it completely.",
         *(["Report outcomes faithfully: if tests fail, say so with the relevant output; if you did not run a verification step, say that rather than implying it succeeded. Never claim \"all tests pass\" when output shows failures, never suppress or simplify failing checks (tests, lints, type errors) to manufacture a green result, and never characterize incomplete or broken work as done. Equally, when a check did pass or a task is complete, state it plainly — do not hedge confirmed results with unnecessary disclaimers, downgrade finished work to \"partial,\" or re-verify things you already checked. The goal is an accurate report, not a defensive one."] if user_type == "ant" else []),
-        *(["If the user reports a bug, slowness, or unexpected behavior with Claude Code itself (as opposed to asking you to fix their own code), recommend the appropriate slash command: /issue for model-related problems (odd outputs, wrong tool choices, hallucinations, refusals), or /share to upload the full session transcript for product bugs, crashes, slowness, or general issues. Only recommend these when the user is describing a problem with Claude Code. After /share produces a ccshare link, if you have a Slack MCP tool available, offer to post the link to #claude-code-feedback (channel ID C07VBSHV7EV) for the user."] if user_type == "ant" else []),
+        *(["If the user reports a bug, slowness, or unexpected behavior with Agent Base itself (as opposed to asking you to fix their own code), recommend the appropriate slash command: /issue for model-related problems, or /share to upload the full session transcript for product bugs, crashes, slowness, or general issues. Only recommend these when the user is describing a problem with Agent Base."] if user_type == "ant" else []),
         "If the user asks for help or wants to give feedback inform them of the following:",
         user_help_subitems,
     ]
@@ -236,7 +236,7 @@ def get_simple_tone_and_style_section(user_type: str = "external") -> str:
         "Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.",
         "Your responses should be short and concise." if user_type != "ant" else None,
         "When referencing specific functions or pieces of code include the pattern file_path:line_number to allow the user to easily navigate to the source code location.",
-        "When referencing GitHub issues or pull requests, use the owner/repo#123 format (e.g. anthropics/claude-code#100) so they render as clickable links.",
+        "When referencing GitHub issues or pull requests, use the owner/repo#123 format so they render as clickable links.",
         'Do not use a colon before tool calls. Your tool calls may not be shown directly in the output, so text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.',
     ]
     return "\n".join(["# Tone and style", *prepend_bullets([item for item in items if item is not None])])
@@ -271,17 +271,13 @@ If you can say it in one sentence, don't use three. Prefer short, direct sentenc
 
 def get_knowledge_cutoff(model_id: str) -> str | None:
     """获取knowledge cutoff，供提示词拼接流程使用。"""
-    canonical = model_id
-    if "claude-sonnet-4-6" in canonical:
+    canonical = model_id.lower()
+    if "agent-kernel-frontier" in canonical:
+        return "May 2025"
+    if "agent-kernel-balanced" in canonical:
         return "August 2025"
-    if "claude-opus-4-6" in canonical:
-        return "May 2025"
-    if "claude-opus-4-5" in canonical:
-        return "May 2025"
-    if "claude-haiku-4" in canonical:
+    if "agent-kernel-fast" in canonical:
         return "February 2025"
-    if "claude-opus-4" in canonical or "claude-sonnet-4" in canonical:
-        return "January 2025"
     return None
 
 
@@ -289,28 +285,12 @@ def get_marketing_name_for_model(model_id: str) -> str | None:
     """获取marketing name for model，供提示词拼接流程使用。"""
     has_1m = "[1m]" in model_id.lower()
     canonical = model_id.lower()
-    if "claude-opus-4-6" in canonical:
-        return "Opus 4.6 (with 1M context)" if has_1m else "Opus 4.6"
-    if "claude-opus-4-5" in canonical:
-        return "Opus 4.5"
-    if "claude-opus-4-1" in canonical:
-        return "Opus 4.1"
-    if "claude-opus-4" in canonical:
-        return "Opus 4"
-    if "claude-sonnet-4-6" in canonical:
-        return "Sonnet 4.6 (with 1M context)" if has_1m else "Sonnet 4.6"
-    if "claude-sonnet-4-5" in canonical:
-        return "Sonnet 4.5 (with 1M context)" if has_1m else "Sonnet 4.5"
-    if "claude-sonnet-4" in canonical:
-        return "Sonnet 4 (with 1M context)" if has_1m else "Sonnet 4"
-    if "claude-3-7-sonnet" in canonical:
-        return "Claude 3.7 Sonnet"
-    if "claude-3-5-sonnet" in canonical:
-        return "Claude 3.5 Sonnet"
-    if "claude-haiku-4-5" in canonical:
-        return "Haiku 4.5"
-    if "claude-3-5-haiku" in canonical:
-        return "Claude 3.5 Haiku"
+    if "agent-kernel-frontier" in canonical:
+        return "frontier model (with 1M context)" if has_1m else "frontier model"
+    if "agent-kernel-balanced" in canonical:
+        return "balanced model (with 1M context)" if has_1m else "balanced model"
+    if "agent-kernel-fast" in canonical:
+        return "fast model"
     return None
 
 
@@ -342,9 +322,9 @@ def compute_simple_env_info(
             f"OS Version: {config.os_version}",
             model_description,
             knowledge_cutoff_message,
-            f"The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.6: '{CLAUDE_4_5_OR_4_6_MODEL_IDS['opus']}', Sonnet 4.6: '{CLAUDE_4_5_OR_4_6_MODEL_IDS['sonnet']}', Haiku 4.5: '{CLAUDE_4_5_OR_4_6_MODEL_IDS['haiku']}'. When building AI applications, default to the latest and most capable Claude models.",
-            "Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).",
-            f"Fast mode for Claude Code uses the same {FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.",
+            f"Default model aliases are frontier: '{GENERIC_MODEL_IDS['frontier']}', balanced: '{GENERIC_MODEL_IDS['balanced']}', and fast: '{GENERIC_MODEL_IDS['fast']}'. For production use, configure the exact provider model with AGENT_KERNEL_MODEL or the provider-specific model environment variable.",
+            "Agent Base is available as a local CLI with provider-compatible adapters and opt-in capabilities.",
+            f"Fast mode, when exposed by a host application, keeps the same {FRONTIER_MODEL_NAME} unless the user explicitly changes the provider model.",
         ]
     )
     filtered = [item for item in env_items if item is not None]
@@ -425,7 +405,7 @@ class PromptComposer:
         if self.config.simple_mode:
             # simple mode 刻意跳过工具、memory 和风格段，提供最小 system prompt。
             return [
-                f"You are Claude Code, Anthropic's official CLI for Claude.\n\nCWD: {self.config.cwd}\nDate: {self.config.session_start_date}"
+                f"You are Agent Base, a local agent CLI.\n\nCWD: {self.config.cwd}\nDate: {self.config.session_start_date}"
             ]
         enabled_tools = {getattr(tool, "name", "") for tool in tools}
         skills = load_skills(self.config)

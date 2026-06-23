@@ -306,7 +306,7 @@ async def _normalize_hook_return(value: Any) -> AsyncIterator[HookResult]:
 
 def _hook_result_from_dict(value: dict[str, Any]) -> HookResult:
     """完成 ``_hook_result_from_dict`` 对应的hook 生命周期内部步骤。"""
-    # 同时接受通用顶层字段和 Claude Code hookSpecificOutput 嵌套形态。
+    # 同时接受通用顶层字段和兼容 hookSpecificOutput 嵌套形态。
     hook_specific = value.get("hookSpecificOutput")
     permission_request_result = value.get("permissionRequestResult")
     permission_behavior = value.get("permissionBehavior")

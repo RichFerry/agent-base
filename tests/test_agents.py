@@ -300,7 +300,7 @@ def test_fork_subagent_omitted_type_inherits_parent_context_and_runs_async(tmp_p
         "description": "API audit",
         "prompt": "Audit API surface.",
         "name": "api-audit",
-        "model": "haiku",
+        "model": "fast",
     }
 
     async def _run():
@@ -378,7 +378,7 @@ def test_subagent_model_argument_overrides_agent_definition_model(tmp_path: Path
                 description="Model test",
                 prompt="Use the configured model unless overridden.",
                 tools=("Read",),
-                model="haiku",
+                model="fast",
             ),
         ),
     )
@@ -400,9 +400,9 @@ def test_subagent_model_argument_overrides_agent_definition_model(tmp_path: Path
             parent_context=parent_context,
             model_provider=provider,
             model="parent-model",
-            model_override="sonnet",
+            model_override="balanced",
         )
     )
 
     assert result["status"] == "completed"
-    assert provider.calls[0]["options"]["model"] == "sonnet"
+    assert provider.calls[0]["options"]["model"] == "balanced"
