@@ -357,11 +357,11 @@ def test_settings_mcp_timeouts_pass_to_config_loader(
 
     monkeypatch.setattr(local_agent, "load_mcp_config", fake_load_mcp_config)
 
-    exit_code = main(["mcp", "doctor", "--cwd", str(repo), "--config-home", str(tmp_path / ".claude")])
+    exit_code = main(["mcp", "doctor", "--mcp-start", "--cwd", str(repo), "--config-home", str(tmp_path / ".claude")])
     captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert "mcp ok (0 servers)" in captured.out
+    assert "mcp ok (0 servers) started=true" in captured.out
     assert captured_calls == [
         {
             "path": mcp_config,

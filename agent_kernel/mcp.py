@@ -22,6 +22,7 @@ import re
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -133,11 +134,24 @@ class StdioMCPClient:
         self.next_id = 1
         self.calls: list[dict[str, Any]] = []
         self.stderr_tail = ""
+        self.diagnostics: dict[str, Any] = {
+            "name": name,
+            "normalizedName": normalize_name_for_mcp(name),
+            "command": list(command),
+            "cwd": str(cwd) if cwd is not None else None,
+            "startupTimeout": self.startup_timeout_seconds,
+            "toolTimeout": self.timeout_seconds,
+            "status": "created",
+            "phase": "created",
+            "stderrTail": "",
+            "exitCode": None,
+        }
 
     def start(self) -> None:
         """Start the configured local stdio process."""
         if not self.command or not self.command[0]:
             raise MCPConfigurationError(f'MCP server "{self.name}" command is empty.')
+        self.diagnostics["phase"] = "start"
         self.process = subprocess.Popen(
             self.command,
             cwd=str(self.cwd) if self.cwd is not None else None,
@@ -148,6 +162,7 @@ class StdioMCPClient:
             text=True,
             bufsize=1,
         )
+        self.diagnostics["status"] = "running"
 
     def request(self, method: str, params: dict[str, Any] | None = None, *, timeout_seconds: float | None = None) -> Any:
         """Send one JSON-RPC request and wait for the matching response."""
@@ -156,6 +171,7 @@ class StdioMCPClient:
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise RuntimeError(f'MCP server "{self.name}" is not connected.')
         if self.process.poll() is not None:
+            self.diagnostics["exitCode"] = self.process.poll()
             raise RuntimeError(f'MCP server "{self.name}" exited before {method}.')
         message_id = self.next_id
         self.next_id += 1
@@ -172,11 +188,16 @@ class StdioMCPClient:
             readable, _, _ = select.select([self.process.stdout], [], [], timeout)
             if not readable:
                 self._capture_stderr_tail()
+                self.diagnostics["phase"] = method
+                self.diagnostics["status"] = "timeout"
                 suffix = f" stderr={self.stderr_tail}" if self.stderr_tail else ""
                 raise TimeoutError(f'MCP server "{self.name}" did not answer {method}.{suffix}')
             line = self.process.stdout.readline()
             if not line:
                 self._capture_stderr_tail()
+                self.diagnostics["phase"] = method
+                self.diagnostics["status"] = "exited"
+                self.diagnostics["exitCode"] = self.process.poll()
                 suffix = f" stderr={self.stderr_tail}" if self.stderr_tail else ""
                 raise RuntimeError(f'MCP server "{self.name}" exited before answering {method}.{suffix}')
             try:
@@ -188,7 +209,11 @@ class StdioMCPClient:
             if "error" in response:
                 error = response["error"]
                 if isinstance(error, dict):
+                    self.diagnostics["phase"] = method
+                    self.diagnostics["status"] = "error"
                     raise RuntimeError(str(error.get("message") or error))
+                self.diagnostics["phase"] = method
+                self.diagnostics["status"] = "error"
                 raise RuntimeError(str(error))
             return response.get("result")
 
@@ -208,6 +233,7 @@ class StdioMCPClient:
 
     def initialize(self) -> dict[str, Any]:
         """Initialize the MCP server and send the initialized notification."""
+        self.diagnostics["phase"] = "initialize"
         result = self.request(
             "initialize",
             {
@@ -218,32 +244,41 @@ class StdioMCPClient:
             timeout_seconds=self.startup_timeout_seconds,
         )
         self.notify("notifications/initialized")
+        self.diagnostics["status"] = "initialized"
         return result if isinstance(result, dict) else {}
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return tools exposed by the server."""
+        self.diagnostics["phase"] = "tools/list"
         result = self.request("tools/list", {}, timeout_seconds=self.startup_timeout_seconds)
         tools = result.get("tools") if isinstance(result, dict) else None
         if not isinstance(tools, list):
             raise RuntimeError(f'MCP server "{self.name}" returned no tools.')
-        return [tool for tool in tools if isinstance(tool, dict)]
+        tool_list = [tool for tool in tools if isinstance(tool, dict)]
+        self.diagnostics["tools"] = [str(tool.get("name") or "") for tool in tool_list]
+        return tool_list
 
     def list_resources(self) -> list[dict[str, Any]]:
         """Return resources exposed by the server, or an empty list when unsupported."""
+        self.diagnostics["phase"] = "resources/list"
         try:
             result = self.request("resources/list", {}, timeout_seconds=self.startup_timeout_seconds)
         except RuntimeError:
             return []
         resources = result.get("resources") if isinstance(result, dict) else None
-        return [resource for resource in resources if isinstance(resource, dict)] if isinstance(resources, list) else []
+        resource_list = [resource for resource in resources if isinstance(resource, dict)] if isinstance(resources, list) else []
+        self.diagnostics["resources"] = [str(resource.get("uri") or "") for resource in resource_list]
+        return resource_list
 
     def call_tool(self, tool_name: str, args: dict[str, Any]) -> Any:
         """Call a server tool through the JSON-RPC connection."""
+        self.diagnostics["phase"] = "tools/call"
         self.calls.append({"tool_name": tool_name, "args": dict(args)})
         return self.request("tools/call", {"name": tool_name, "arguments": args})
 
     def read_resource(self, uri: str) -> Any:
         """Read a server resource through the JSON-RPC connection."""
+        self.diagnostics["phase"] = "resources/read"
         return self.request("resources/read", {"uri": uri})
 
     def close(self) -> None:
@@ -267,6 +302,10 @@ class StdioMCPClient:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=2)
+        self._capture_stderr_tail()
+        self.diagnostics["status"] = "closed"
+        self.diagnostics["exitCode"] = process.poll()
+        self.diagnostics["stderrTail"] = self.stderr_tail
 
     def _capture_stderr_tail(self) -> None:
         process = self.process
@@ -301,6 +340,7 @@ class StdioMCPClient:
         if chunks:
             diagnostic = _redact_mcp_diagnostic("".join(chunks), self.env)
             self.stderr_tail = (self.stderr_tail + diagnostic)[-MAX_MCP_STDERR_TAIL_CHARS:]
+            self.diagnostics["stderrTail"] = self.stderr_tail
 
 
 def _resolve_stdio_command(command: str, args: list[str]) -> list[str]:
@@ -374,6 +414,98 @@ def _validate_mcp_tool_and_resource_names(server_name: str, tools: list[dict[str
         if uri in seen_resources:
             raise MCPConfigurationError(f'MCP server "{server_name}" returned duplicate resource uri "{uri}".')
         seen_resources.add(uri)
+
+
+def _json_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8", errors="replace"))
+
+
+def _mcp_metadata(
+    *,
+    server_name: str,
+    operation: str,
+    status: str,
+    duration_ms: int,
+    content: Any = None,
+    tool_name: str | None = None,
+    resource_uri: str | None = None,
+    truncated: bool = False,
+    error_type: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "serverName": server_name,
+        "normalizedServerName": normalize_name_for_mcp(server_name),
+        "operation": operation,
+        "status": status,
+        "durationMs": duration_ms,
+        "contentSize": _json_size(content),
+        "truncated": truncated,
+    }
+    if tool_name is not None:
+        metadata["toolName"] = tool_name
+        metadata["normalizedToolName"] = normalize_name_for_mcp(tool_name)
+    if resource_uri is not None:
+        metadata["resourceUri"] = resource_uri
+    if error_type is not None:
+        metadata["errorType"] = error_type
+    return metadata
+
+
+def static_mcp_config_summary(
+    path: str | Path,
+    *,
+    startup_timeout_seconds: float | None = None,
+    tool_timeout_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    """Validate a local MCP config and summarize it without starting processes."""
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        raise MCPConfigurationError(f"MCP config does not exist: {config_path}")
+    if not config_path.is_file():
+        raise MCPConfigurationError(f"MCP config path is not a file: {config_path}")
+    payload = _load_json_config(config_path)
+    servers: list[dict[str, Any]] = []
+    for server_name, server_config in _server_entries_from_config(payload).items():
+        disabled = server_config.get("disabled") is True
+        server_type = str(server_config.get("type") or "stdio")
+        if server_type != "stdio":
+            raise MCPConfigurationError(f'MCP server "{server_name}" uses unsupported type "{server_type}". Only local stdio is supported.')
+        command = str(server_config.get("command") or "").strip()
+        if not disabled and not command:
+            raise MCPConfigurationError(f'MCP server "{server_name}" must include command.')
+        raw_args = server_config.get("args") or []
+        if not isinstance(raw_args, list):
+            raise MCPConfigurationError(f'MCP server "{server_name}" args must be an array.')
+        raw_env = server_config.get("env") or {}
+        if not isinstance(raw_env, dict):
+            raise MCPConfigurationError(f'MCP server "{server_name}" env must be an object.')
+        default_startup_timeout = startup_timeout_seconds if startup_timeout_seconds is not None else tool_timeout_seconds
+        startup_timeout = _positive_timeout(
+            server_config.get("startupTimeout", server_config.get("toolTimeout", default_startup_timeout)),
+            label=f'MCP server "{server_name}" startup timeout',
+            default=5.0,
+        )
+        tool_timeout = _positive_timeout(server_config.get("toolTimeout", tool_timeout_seconds), label=f'MCP server "{server_name}" timeout', default=startup_timeout)
+        servers.append(
+            {
+                "name": server_name,
+                "normalizedName": normalize_name_for_mcp(server_name),
+                "configPath": str(config_path),
+                "type": server_type,
+                "disabled": disabled,
+                "commandConfigured": bool(command),
+                "argsCount": len(raw_args),
+                "envKeys": sorted(str(key) for key in raw_env),
+                "cwd": str(server_config.get("cwd")) if server_config.get("cwd") else None,
+                "startupTimeout": startup_timeout,
+                "toolTimeout": tool_timeout,
+                "instructionsConfigured": bool(server_config.get("instructions")),
+            }
+        )
+    return servers
 
 
 def load_mcp_config(
@@ -590,6 +722,7 @@ class MCPTool(Tool):
 
     async def call(self, args: dict, context: ToolUseContext, can_use_tool, parent_message: AssistantMessage, on_progress=None) -> ToolResult:
         """执行工具核心逻辑，并返回标准 ToolResult。"""
+        started = time.monotonic()
         if on_progress:
             on_progress(
                 {
@@ -607,6 +740,15 @@ class MCPTool(Tool):
             raise RuntimeError(f'MCP server "{self.server_name}" is not connected.')
         result = await _call_mcp_tool(client_config, self.tool_name, args)
         transformed = transform_mcp_result(result)
+        metadata = _mcp_metadata(
+            server_name=self.server_name,
+            tool_name=self.tool_name,
+            operation="tools/call",
+            status="ok",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            content=transformed,
+            truncated=False,
+        )
         if on_progress:
             on_progress(
                 {
@@ -616,10 +758,17 @@ class MCPTool(Tool):
                     "toolName": self.tool_name,
                 }
             )
-        return ToolResult(transformed)
+        return ToolResult({"content": transformed, "mcpMetadata": metadata})
 
     def map_tool_result_to_tool_result_block_param(self, content: Any, tool_use_id: str) -> ToolResultBlock:
         """把工具内部结果映射为 Anthropic tool_result block。"""
+        if isinstance(content, dict) and "mcpMetadata" in content and "content" in content:
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": content["content"],
+                "mcpMetadata": content["mcpMetadata"],
+            }
         return {"tool_use_id": tool_use_id, "type": "tool_result", "content": content}
 
     def to_api_spec(self) -> dict[str, Any]:
@@ -669,6 +818,7 @@ class ListMcpResourcesTool(Tool):
 
     async def call(self, args: dict, context: ToolUseContext, can_use_tool, parent_message: AssistantMessage, on_progress=None) -> ToolResult:
         """执行工具核心逻辑，并返回标准 ToolResult。"""
+        started = time.monotonic()
         target_server = args.get("server")
         clients = [client for client in context.config.mcp_clients if client.type == "connected"]
         if target_server:
@@ -680,15 +830,33 @@ class ListMcpResourcesTool(Tool):
         for client in clients:
             for resource in client.resources:
                 resources.append({**resource, "server": resource.get("server", client.name)})
-        return ToolResult(resources)
+        server_name = str(target_server or "*")
+        return ToolResult(
+            {
+                "content": resources,
+                "mcpMetadata": _mcp_metadata(
+                    server_name=server_name,
+                    operation="resources/list",
+                    status="ok",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    content=resources,
+                    truncated=False,
+                ),
+            }
+        )
 
     def map_tool_result_to_tool_result_block_param(self, content: Any, tool_use_id: str) -> ToolResultBlock:
         """把工具内部结果映射为 Anthropic tool_result block。"""
-        if not content:
+        metadata = content.get("mcpMetadata") if isinstance(content, dict) else None
+        payload = content.get("content") if isinstance(content, dict) and "content" in content else content
+        if not payload:
             text = "No resources found. MCP servers may still provide tools even if they have no resources."
         else:
-            text = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
-        return {"tool_use_id": tool_use_id, "type": "tool_result", "content": text}
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        block: ToolResultBlock = {"tool_use_id": tool_use_id, "type": "tool_result", "content": text}
+        if metadata is not None:
+            block["mcpMetadata"] = metadata
+        return block
 
 
 class ReadMcpResourceTool(Tool):
@@ -721,6 +889,7 @@ class ReadMcpResourceTool(Tool):
 
     async def call(self, args: dict, context: ToolUseContext, can_use_tool, parent_message: AssistantMessage, on_progress=None) -> ToolResult:
         """执行工具核心逻辑，并返回标准 ToolResult。"""
+        started = time.monotonic()
         server_name = args["server"]
         uri = args["uri"]
         client = next((client for client in context.config.mcp_clients if client.name == server_name), None)
@@ -733,15 +902,51 @@ class ReadMcpResourceTool(Tool):
             result = client.read_resource_handler(uri)
             if hasattr(result, "__await__"):
                 result = await result
-            return ToolResult(result)
+            return ToolResult(
+                {
+                    "content": result,
+                    "mcpMetadata": _mcp_metadata(
+                        server_name=server_name,
+                        operation="resources/read",
+                        status="ok",
+                        duration_ms=int((time.monotonic() - started) * 1000),
+                        content=result,
+                        resource_uri=uri,
+                        truncated=False,
+                    ),
+                }
+            )
         resource = next((resource for resource in client.resources if resource.get("uri") == uri), None)
         if resource is None:
             raise RuntimeError(f'Resource "{uri}" not found on server "{server_name}"')
-        return ToolResult({"contents": [resource]})
+        result = {"contents": [resource]}
+        return ToolResult(
+            {
+                "content": result,
+                "mcpMetadata": _mcp_metadata(
+                    server_name=server_name,
+                    operation="resources/read",
+                    status="ok",
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    content=result,
+                    resource_uri=uri,
+                    truncated=False,
+                ),
+            }
+        )
 
     def map_tool_result_to_tool_result_block_param(self, content: Any, tool_use_id: str) -> ToolResultBlock:
         """把工具内部结果映射为 Anthropic tool_result block。"""
-        return {"tool_use_id": tool_use_id, "type": "tool_result", "content": json.dumps(content, ensure_ascii=False, separators=(",", ":"))}
+        metadata = content.get("mcpMetadata") if isinstance(content, dict) else None
+        payload = content.get("content") if isinstance(content, dict) and "content" in content else content
+        block: ToolResultBlock = {
+            "tool_use_id": tool_use_id,
+            "type": "tool_result",
+            "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        }
+        if metadata is not None:
+            block["mcpMetadata"] = metadata
+        return block
 
 
 def mcp_tools_from_clients(clients: tuple[MCPClientConfig, ...], *, include_resource_tools: bool = True) -> list[Tool]:

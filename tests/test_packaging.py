@@ -27,7 +27,7 @@ def test_pyproject_packaging_metadata_contract() -> None:
 
     assert pyproject["build-system"]["requires"] == ["setuptools>=61", "wheel"]
     assert project["name"] == "agent-kernel"
-    assert project["version"] == "0.5.0"
+    assert project["version"] == "0.7.0"
     assert "agent kernel" in project["description"].lower()
     assert project["requires-python"] == ">=3.11"
     assert project["dependencies"] == []
@@ -54,6 +54,7 @@ def test_local_runner_help_starts_without_model_credentials() -> None:
     assert "--mcp-config" in result.stdout
     assert "--list-sessions" in result.stdout
     assert "--memory-status" in result.stdout
+    assert "--workspace-doctor" in result.stdout
 
 
 def test_editable_install_exposes_local_runner_console_script(tmp_path: Path) -> None:

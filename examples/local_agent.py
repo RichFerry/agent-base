@@ -25,9 +25,26 @@ if str(REPO_ROOT) not in sys.path:
 
 from agent_kernel import KernelConfig, MCPClientConfig, ModelProvider, QueryEngine, SessionStore, build_model_provider_from_env
 from agent_kernel.memory import ENTRYPOINT_NAME, MemoryLoader
-from agent_kernel.mcp import MCP_CONFIG_ENV, MCPConfigurationError, build_mcp_tool_name, close_mcp_clients, load_mcp_config, normalize_name_for_mcp
+from agent_kernel.mcp import MCP_CONFIG_ENV, MCPConfigurationError, build_mcp_tool_name, close_mcp_clients, load_mcp_config, normalize_name_for_mcp, static_mcp_config_summary
+from agent_kernel.memory_chain import (
+    apply_memory_candidates,
+    extract_memory_candidates,
+    load_candidate_json,
+    memory_provenance,
+    rebuild_memory_index,
+    validate_memory_store,
+)
 from agent_kernel.path_utils import find_git_root
+from agent_kernel.session_diagnostics import (
+    collect_gc_targets,
+    delete_gc_targets,
+    inspect_session,
+    redacted_session_entries,
+    session_timeline,
+    validate_session,
+)
 from agent_kernel.skills import SkillDefinition, skill_from_markdown
+from agent_kernel.workspace import build_workspace_runtime
 import agent_kernel.web_adapters as _web_adapters
 from agent_kernel.web_adapters import (
     WEB_FETCH_MAX_BYTES_ENV,
@@ -731,20 +748,32 @@ def _session_project_dir(cwd: str | Path | None = None, config_home: str | Path 
     return SessionStore(config, session_id="__probe__").project_dir
 
 
+def _session_project_dirs(cwd: str | Path | None = None, config_home: str | Path | None = None) -> tuple[Path, ...]:
+    store = SessionStore(_runner_config(cwd, config_home), session_id="__probe__")
+    dirs = [store.project_dir]
+    if store.legacy_project_dir != store.project_dir:
+        dirs.append(store.legacy_project_dir)
+    return tuple(dirs)
+
+
 def list_local_sessions(cwd: str | Path | None = None, config_home: str | Path | None = None) -> list[str]:
     """Return deterministic local transcript session ids for the runner project."""
-    project_dir = _session_project_dir(cwd, config_home)
-    if not project_dir.exists():
-        return []
-    return sorted(path.stem for path in project_dir.glob("*.jsonl") if path.is_file())
+    session_ids: set[str] = set()
+    for project_dir in _session_project_dirs(cwd, config_home):
+        if project_dir.exists():
+            session_ids.update(path.stem for path in project_dir.glob("*.jsonl") if path.is_file())
+    return sorted(session_ids)
 
 
 def latest_local_session_id(cwd: str | Path | None = None, config_home: str | Path | None = None) -> str | None:
     """Return the most recently modified local transcript session id."""
-    project_dir = _session_project_dir(cwd, config_home)
-    if not project_dir.exists():
-        return None
-    sessions = [path for path in project_dir.glob("*.jsonl") if path.is_file()]
+    sessions = [
+        path
+        for project_dir in _session_project_dirs(cwd, config_home)
+        if project_dir.exists()
+        for path in project_dir.glob("*.jsonl")
+        if path.is_file()
+    ]
     if not sessions:
         return None
     latest = max(sessions, key=lambda path: (path.stat().st_mtime, path.name))
@@ -1181,22 +1210,103 @@ def load_mcp_clients_for_runner(
         raise
 
 
+def _mcp_resource_summary(resource: dict[str, Any]) -> dict[str, Any]:
+    """Return MCP resource metadata without dumping resource body content."""
+    return {
+        key: resource.get(key)
+        for key in ("uri", "name", "mimeType", "description", "server")
+        if resource.get(key) is not None
+    }
+
+
+def _mcp_diagnostics_summary(diagnostics: Any) -> dict[str, Any] | None:
+    if not isinstance(diagnostics, dict):
+        return None
+    return {
+        "name": diagnostics.get("name"),
+        "normalizedName": diagnostics.get("normalizedName"),
+        "commandConfigured": bool(diagnostics.get("command")),
+        "cwd": diagnostics.get("cwd"),
+        "startupTimeout": diagnostics.get("startupTimeout"),
+        "toolTimeout": diagnostics.get("toolTimeout"),
+        "status": diagnostics.get("status"),
+        "phase": diagnostics.get("phase"),
+        "stderrTail": diagnostics.get("stderrTail"),
+        "exitCode": diagnostics.get("exitCode"),
+        "tools": diagnostics.get("tools"),
+        "resources": diagnostics.get("resources"),
+    }
+
+
 def mcp_clients_summary(clients: Sequence[MCPClientConfig]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": client.name,
-            "type": client.type,
-            "tools": [build_mcp_tool_name(client.name, str(tool.get("name") or "")) for tool in client.tools],
-            "resources": [resource.get("uri") for resource in client.resources if isinstance(resource, dict)],
-        }
-        for client in clients
-    ]
+    summaries: list[dict[str, Any]] = []
+    for client in clients:
+        diagnostics = getattr(client.client, "diagnostics", None)
+        summaries.append(
+            {
+                "name": client.name,
+                "normalizedName": normalize_name_for_mcp(client.name),
+                "type": client.type,
+                "tools": [build_mcp_tool_name(client.name, str(tool.get("name") or "")) for tool in client.tools],
+                "toolDetails": [
+                    {
+                        "name": str(tool.get("name") or ""),
+                        "normalizedName": normalize_name_for_mcp(str(tool.get("name") or "")),
+                        "fullName": build_mcp_tool_name(client.name, str(tool.get("name") or "")),
+                        "description": str(tool.get("description") or ""),
+                        "inputSchema": tool.get("inputSchema") or tool.get("input_schema") or {},
+                    }
+                    for tool in client.tools
+                ],
+                "resources": [resource.get("uri") for resource in client.resources if isinstance(resource, dict)],
+                "resourceDetails": [_mcp_resource_summary(resource) for resource in client.resources if isinstance(resource, dict)],
+                "diagnostics": _mcp_diagnostics_summary(diagnostics),
+            }
+        )
+    return summaries
+
+
+def _mcp_static_summaries(
+    fixtures: Sequence[Path],
+    configs: Sequence[Path],
+    *,
+    startup_timeout_seconds: float | None = None,
+    tool_timeout_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for fixture in fixtures:
+        client = load_mcp_fixture(fixture)
+        summaries.extend(mcp_clients_summary((client,)))
+        summaries[-1]["configPath"] = str(fixture)
+        summaries[-1]["source"] = "fixture"
+        summaries[-1]["started"] = False
+    for config in configs:
+        for server in static_mcp_config_summary(
+            config,
+            startup_timeout_seconds=startup_timeout_seconds,
+            tool_timeout_seconds=tool_timeout_seconds,
+        ):
+            summaries.append(
+                {
+                    **server,
+                    "source": "config",
+                    "started": False,
+                    "tools": [],
+                    "toolDetails": [],
+                    "resources": [],
+                    "resourceDetails": [],
+                    "diagnostics": None,
+                }
+            )
+    return summaries
 
 
 def build_local_engine(
     *,
     cwd: str | Path | None = None,
     config_home: str | Path | None = None,
+    workspace_root: str | Path | None = None,
+    settings_paths: Sequence[str | Path] | None = None,
     model_provider: ModelProvider | None = None,
     session_id: str | None = None,
     model: str | None = None,
@@ -1278,6 +1388,10 @@ def build_local_engine(
     )
 
     config_kwargs: dict[str, Any] = {"cwd": Path(cwd).expanduser() if cwd is not None else Path.cwd()}
+    if workspace_root is not None:
+        config_kwargs["workspace_root"] = Path(workspace_root).expanduser()
+    if settings_paths:
+        config_kwargs["settings_paths"] = tuple(Path(path).expanduser() for path in settings_paths)
     if config_home is not None:
         config_kwargs["config_home"] = Path(config_home).expanduser()
     if memory_enabled is not None:
@@ -1287,6 +1401,10 @@ def build_local_engine(
     config_kwargs["skill_discovery_mode"] = skill_discovery_mode
     if mcp_clients:
         config_kwargs["mcp_clients"] = mcp_clients
+    if mcp_config_paths:
+        config_kwargs["mcp_config_paths"] = mcp_config_paths
+    if mcp_fixture_paths:
+        config_kwargs["mcp_fixture_paths"] = mcp_fixture_paths
     config = KernelConfig(**config_kwargs)
 
     engine_kwargs: dict[str, Any] = {
@@ -1500,7 +1618,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-config", type=Path, help=f"Load local runner defaults from JSON. Default: ./{DEFAULT_LOCAL_CONFIG_NAME} when present.")
     parser.add_argument("--init-config", nargs="?", const="", metavar="PATH", help=f"Write a starter local runner config and exit. Default: ./{DEFAULT_LOCAL_CONFIG_NAME}.")
     parser.add_argument("--doctor", action="store_true", help="Inspect local runner config without calling a model or network.")
+    parser.add_argument("--doctor-full", action="store_true", help="Print full local readiness diagnostics without model or network calls.")
     parser.add_argument("--doctor-json", action="store_true", help="Print local runner diagnostics as JSON.")
+    parser.add_argument("--workspace-doctor", action="store_true", help="Print workspace root/storage/capability scope diagnostics.")
     parser.add_argument("--print-effective-config", action="store_true", help="Print redacted effective local runner config and exit.")
     parser.add_argument("--validate-config", action="store_true", help="Validate local runner settings and exit.")
     parser.add_argument("--dry-run-config", action="store_true", help="Validate and print effective config without model, MCP, or network calls.")
@@ -1510,14 +1630,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", dest="json_output", action="store_true", help="Print supported management command output as JSON.")
     parser.add_argument("--json-events", action="store_true", help="Print SDK events as JSON lines while running.")
     parser.add_argument("--print-transcript-path", action="store_true", help="Print the transcript path after a run.")
+    parser.add_argument("--print-session-id", action="store_true", help="Print the session id after a run.")
     parser.add_argument("--debug-tools", action="store_true", help="Print resolved tool names without calling a model.")
     parser.add_argument("--debug-provider", action="store_true", help="Print redacted provider diagnostics without calling a model.")
     parser.add_argument("--session-id", help="Use a stable transcript session id.")
     parser.add_argument("--list-sessions", action="store_true", help="List local transcript session ids for this cwd.")
     parser.add_argument("--session-info", metavar="SESSION_ID", help="Show transcript metadata for a local session.")
+    parser.add_argument("--session-inspect", metavar="SESSION_ID", help="Inspect a local session transcript.")
+    parser.add_argument("--session-validate", metavar="SESSION_ID", help="Validate a local session transcript.")
+    parser.add_argument("--session-timeline", metavar="SESSION_ID", help="Print a redacted ordered session timeline.")
     parser.add_argument("--session-transcript-path", metavar="SESSION_ID", help="Print transcript path for a local session.")
     parser.add_argument("--session-export", metavar="SESSION_ID", help="Print transcript JSONL for a local session.")
+    parser.add_argument("--session-export-redacted", action="store_true", help="Redact secrets and large payloads when exporting a session.")
     parser.add_argument("--session-delete", metavar="SESSION_ID", help="Delete a local session transcript; requires --yes.")
+    parser.add_argument("--session-gc", action="store_true", help="List or delete old local session transcripts.")
+    parser.add_argument("--older-than", type=int, metavar="DAYS", help="Age threshold for --session-gc.")
     parser.add_argument("--resume", metavar="SESSION_ID", help="Resume an existing transcript session id.")
     parser.add_argument("--continue", dest="continue_session", action="store_true", help="Resume the most recently modified local session.")
     parser.add_argument("--yes", action="store_true", help="Confirm destructive local management commands.")
@@ -1530,6 +1657,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-remember", action="store_true", help="Write a structured memory file and update MEMORY.md.")
     parser.add_argument("--memory-forget", metavar="RELATIVE_PATH", help="Delete a memory file; requires --yes.")
     parser.add_argument("--memory-validate", action="store_true", help="Validate memory paths stay inside the memory directory.")
+    parser.add_argument("--memory-extract", metavar="SESSION_ID", help="Extract deterministic memory candidates from a session transcript.")
+    parser.add_argument("--candidate-json", type=Path, help="Candidate JSON to apply with --memory-extract --yes.")
+    parser.add_argument("--memory-rebuild-index", action="store_true", help="Rebuild MEMORY.md from memory files; dry-run unless --yes.")
+    parser.add_argument("--memory-provenance", metavar="RELATIVE_PATH", help="Show extraction provenance for a memory file.")
     parser.add_argument("--memory-type", choices=("user", "feedback", "project", "reference"), help="Memory type for --memory-remember.")
     parser.add_argument("--memory-name", help="Memory name for --memory-remember.")
     parser.add_argument("--memory-text", help="Text to write with --memory-write.")
@@ -1550,7 +1681,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mcp-config", type=Path, action="append", help=f"Load local stdio MCP servers from config JSON. Env: {MCP_CONFIG_ENV}. Repeatable.")
     parser.add_argument("--mcp-list", action="store_true", help="List configured MCP servers/tools without calling a model.")
     parser.add_argument("--mcp-doctor", action="store_true", help="Validate configured MCP files without calling a model.")
+    parser.add_argument("--mcp-start", action="store_true", help="With --mcp-doctor, start local stdio servers and shut them down.")
+    parser.add_argument("--mcp-inspect", metavar="SERVER", help="Inspect one MCP server's tools/resources without calling a model.")
     parser.add_argument("--mcp-validate-config", type=Path, help="Validate one local stdio MCP config path.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview management changes without mutating files.")
     parser.add_argument("--quiet", action="store_true", help="Only print assistant final responses to stdout.")
     return parser
 
@@ -1575,11 +1709,24 @@ def local_doctor_lines(
     skills_dirs: Sequence[Path],
     mcp_fixtures: Sequence[Path],
     mcp_configs: Sequence[Path],
+    cwd: Path | None = None,
+    config_home: Path | None = None,
 ) -> list[str]:
     """Return non-secret local runner diagnostics."""
     provider = (env.get("AGENT_KERNEL_PROVIDER") or "anthropic").strip().lower()
     model = env.get("AGENT_KERNEL_MODEL") or env.get("ANTHROPIC_MODEL") or env.get("OPENAI_MODEL") or ""
+    runtime = workspace_runtime_json(
+        config,
+        cwd=cwd or Path.cwd(),
+        config_home=config_home,
+        skills_dirs=skills_dirs,
+        mcp_fixtures=mcp_fixtures,
+        mcp_configs=mcp_configs,
+    )["workspace"]
     return [
+        f"workspace_root={runtime['workspaceRoot']}",
+        f"sessions_dir={runtime['sessions']['dir']}",
+        f"memory_scope={runtime['memory']['scope']} memory_dir={runtime['memory']['dir']}",
         f"config_path={config.path if config.path is not None else 'not-found'}",
         f"config_paths={','.join(str(path) for path in config.paths) if config.paths else 'none'}",
         f"provider={provider}",
@@ -1608,12 +1755,22 @@ def local_doctor_json(
     skills_dirs: Sequence[Path],
     mcp_fixtures: Sequence[Path],
     mcp_configs: Sequence[Path],
+    cwd: Path | None = None,
+    config_home: Path | None = None,
 ) -> dict[str, Any]:
     provider = (env.get("AGENT_KERNEL_PROVIDER") or "anthropic").strip().lower()
     model = env.get("AGENT_KERNEL_MODEL") or env.get("ANTHROPIC_MODEL") or env.get("OPENAI_MODEL") or ""
     return {
         "configPath": str(config.path) if config.path is not None else None,
         "configPaths": [str(path) for path in config.paths],
+        "workspace": workspace_runtime_json(
+            config,
+            cwd=cwd or Path.cwd(),
+            config_home=config_home,
+            skills_dirs=skills_dirs,
+            mcp_fixtures=mcp_fixtures,
+            mcp_configs=mcp_configs,
+        )["workspace"],
         "provider": provider,
         "model": model or None,
         "baseUrlConfigured": bool(env.get("AGENT_KERNEL_BASE_URL") or env.get("ANTHROPIC_BASE_URL") or env.get("OPENAI_BASE_URL")),
@@ -1626,6 +1783,92 @@ def local_doctor_json(
         "mcpFixtures": [str(path) for path in mcp_fixtures],
         "mcpConfigs": [str(path) for path in mcp_configs],
         "defaultTests": "offline",
+    }
+
+
+def workspace_runtime_json(
+    config: LocalRunnerConfig,
+    *,
+    cwd: str | Path,
+    config_home: str | Path | None,
+    skills_dirs: Sequence[str | Path],
+    mcp_fixtures: Sequence[str | Path],
+    mcp_configs: Sequence[str | Path],
+) -> dict[str, Any]:
+    kernel_config = _runner_config(cwd, config_home, memory_enabled=config.memory_enabled)
+    runtime = build_workspace_runtime(
+        cwd=kernel_config.cwd,
+        config_home=kernel_config.config_home,
+        workspace_root=kernel_config.workspace_root,
+        settings_paths=config.paths,
+        skill_paths=skills_dirs,
+        mcp_config_paths=mcp_configs,
+        mcp_fixture_paths=mcp_fixtures,
+        memory_enabled=kernel_config.auto_memory_enabled,
+    )
+    return {
+        "schemaVersion": "0.7",
+        "settingsFile": DEFAULT_LOCAL_CONFIG_NAME,
+        "workspace": runtime.as_json(),
+    }
+
+
+def local_full_doctor_json(
+    config: LocalRunnerConfig,
+    *,
+    env: Mapping[str, str],
+    permission_mode: str,
+    max_turns: int,
+    web_search_enabled: bool,
+    web_fetch_enabled: bool,
+    skills_dirs: Sequence[Path],
+    mcp_fixtures: Sequence[Path],
+    mcp_configs: Sequence[Path],
+    cwd: Path,
+    config_home: Path | None,
+) -> dict[str, Any]:
+    """Return readiness diagnostics without model, network, or stdio startup."""
+    base = local_doctor_json(
+        config,
+        env=env,
+        permission_mode=permission_mode,
+        max_turns=max_turns,
+        web_search_enabled=web_search_enabled,
+        web_fetch_enabled=web_fetch_enabled,
+        skills_dirs=skills_dirs,
+        mcp_fixtures=mcp_fixtures,
+        mcp_configs=mcp_configs,
+        cwd=cwd,
+        config_home=config_home,
+    )
+    mcp_status: dict[str, Any]
+    try:
+        mcp_status = {
+            "status": "ok",
+            "servers": _mcp_static_summaries(
+                mcp_fixtures,
+                mcp_configs,
+                startup_timeout_seconds=config.mcp_startup_timeout,
+                tool_timeout_seconds=config.mcp_tool_timeout,
+            ),
+        }
+    except (MCPConfigurationError, MCPFixtureConfigurationError) as exc:
+        mcp_status = {"status": "error", "error": str(exc), "servers": []}
+    memory_status = validate_memory_store(
+        cwd=cwd,
+        config_home=config_home,
+        memory_enabled=config.memory_enabled,
+        memory_default_path=config.memory_default_path,
+    )
+    session_infos = list_local_session_infos(cwd, config_home)
+    return {
+        "schemaVersion": "0.7",
+        **base,
+        "sessions": {"count": len(session_infos), "items": session_infos},
+        "memory": memory_status,
+        "mcp": mcp_status,
+        "networkDefault": "offline",
+        "realSmoke": "opt-in",
     }
 
 
@@ -1643,10 +1886,20 @@ def effective_config_json(
     skills_dirs: Sequence[Path],
     mcp_fixtures: Sequence[Path],
     mcp_configs: Sequence[Path],
+    cwd: Path | None = None,
+    config_home: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "settingsFile": DEFAULT_LOCAL_CONFIG_NAME,
         "configPaths": [str(path) for path in config.paths],
+        "workspace": workspace_runtime_json(
+            config,
+            cwd=cwd or Path.cwd(),
+            config_home=config_home,
+            skills_dirs=skills_dirs,
+            mcp_fixtures=mcp_fixtures,
+            mcp_configs=mcp_configs,
+        )["workspace"],
         "provider": {
             "type": env.get("AGENT_KERNEL_PROVIDER") or "anthropic",
             "model": env.get("AGENT_KERNEL_MODEL") or env.get("ANTHROPIC_MODEL") or env.get("OPENAI_MODEL") or None,
@@ -1729,8 +1982,59 @@ async def _run_cli(args: argparse.Namespace) -> int:
     effective_search_enabled = enable_web_search or bool(web_search_provider or web_search_stub_results)
     effective_fetch_enabled = enable_web_fetch or bool(web_fetch_provider)
 
+    if args.workspace_doctor:
+        payload = workspace_runtime_json(
+            local_config,
+            cwd=args.cwd,
+            config_home=args.config_home,
+            skills_dirs=skills_dirs,
+            mcp_fixtures=mcp_fixtures,
+            mcp_configs=mcp_configs,
+        )
+        if args.json_output:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            workspace = payload["workspace"]
+            print(f"cwd={workspace['cwd']}")
+            print(f"workspace_root={workspace['workspaceRoot']}")
+            print(f"workspace_root_source={workspace['workspaceRootSource']}")
+            print(f"config_home={workspace['configHome']}")
+            print(f"sessions_dir={workspace['sessions']['dir']}")
+            print(f"memory_scope={workspace['memory']['scope']}")
+            print(f"memory_dir={workspace['memory']['dir']}")
+            print(f"artifacts_dir={workspace['artifacts']['dir']}")
+            print("act_allowed_dirs=" + ",".join(workspace["actMode"]["allowedWorkingDirectories"]))
+            print("settings_sources=" + (",".join(item["path"] for item in workspace["settingsSources"]) or "none"))
+            print("skills_sources=" + (",".join(item["path"] for item in workspace["skillSources"]) or "none"))
+            print("mcp_sources=" + (",".join(item["path"] for item in workspace["mcpSources"]) or "none"))
+        return 0
+
     if args.validate_config:
         print(f"{DEFAULT_LOCAL_CONFIG_NAME} ok")
+        return 0
+
+    if args.doctor_full:
+        payload = local_full_doctor_json(
+            local_config,
+            env=configured_env,
+            permission_mode=permission_mode,
+            max_turns=max_turns,
+            web_search_enabled=effective_search_enabled,
+            web_fetch_enabled=effective_fetch_enabled,
+            skills_dirs=skills_dirs,
+            mcp_fixtures=mcp_fixtures,
+            mcp_configs=mcp_configs,
+            cwd=args.cwd,
+            config_home=args.config_home,
+        )
+        if args.json_output or args.doctor_json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"schemaVersion={payload['schemaVersion']}")
+            print(f"sessions={payload['sessions']['count']}")
+            print(f"memory={payload['memory']['status']}")
+            print(f"mcp={payload['mcp']['status']}")
+            print("default_tests=offline")
         return 0
 
     if args.doctor_json:
@@ -1746,6 +2050,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     skills_dirs=skills_dirs,
                     mcp_fixtures=mcp_fixtures,
                     mcp_configs=mcp_configs,
+                    cwd=args.cwd,
+                    config_home=args.config_home,
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -1764,6 +2070,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
             skills_dirs=skills_dirs,
             mcp_fixtures=mcp_fixtures,
             mcp_configs=mcp_configs,
+            cwd=args.cwd,
+            config_home=args.config_home,
         ):
             print(line)
         return 0
@@ -1781,6 +2089,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
         skills_dirs=skills_dirs,
         mcp_fixtures=mcp_fixtures,
         mcp_configs=mcp_configs,
+        cwd=args.cwd,
+        config_home=args.config_home,
     )
     if args.print_effective_config or args.dry_run_config or debug_config:
         print(json.dumps(effective, ensure_ascii=False, indent=2))
@@ -1811,6 +2121,41 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 print(f"{key}={value}")
         return 0
 
+    if args.session_inspect:
+        info = inspect_session(args.session_inspect, cwd=args.cwd, config_home=args.config_home)
+        if not info["exists"]:
+            print(f"error: Session transcript does not exist: {args.session_inspect}", file=sys.stderr)
+            return 2
+        if args.json_output:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+        else:
+            for key, value in info.items():
+                print(f"{key}={value}")
+        return 0
+
+    if args.session_validate:
+        result = validate_session(args.session_validate, cwd=args.cwd, config_home=args.config_home)
+        if args.json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result["status"] == "ok":
+            print(f"session ok ({result['summary']['messageCount']} messages)")
+        else:
+            for issue in result["issues"]:
+                print(f"{issue['severity']}:{issue['code']}: {issue['message']}")
+        return 0 if result["status"] == "ok" else 1
+
+    if args.session_timeline:
+        result = session_timeline(args.session_timeline, cwd=args.cwd, config_home=args.config_home)
+        if not result.get("exists", True):
+            print(f"error: Session transcript does not exist: {args.session_timeline}", file=sys.stderr)
+            return 2
+        if args.json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            for item in result["events"]:
+                print(f"{item['index']}\t{item.get('kind')}\t{item.get('uuid')}")
+        return 0
+
     if args.session_transcript_path:
         print(session_info(args.session_transcript_path, cwd=args.cwd, config_home=args.config_home)["transcriptPath"])
         return 0
@@ -1820,7 +2165,11 @@ async def _run_cli(args: argparse.Namespace) -> int:
         if not store.transcript_path.exists():
             print(f"error: Session transcript does not exist: {args.session_export}", file=sys.stderr)
             return 2
-        print(store.transcript_path.read_text(encoding="utf-8"), end="")
+        if args.session_export_redacted:
+            for entry in redacted_session_entries(args.session_export, cwd=args.cwd, config_home=args.config_home):
+                print(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(store.transcript_path.read_text(encoding="utf-8"), end="")
         return 0
 
     if args.session_delete:
@@ -1833,6 +2182,33 @@ async def _run_cli(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(f"deleted {path}")
+        return 0
+
+    if args.session_gc:
+        if args.older_than is not None and args.older_than < 0:
+            print("error: --older-than must be zero or greater.", file=sys.stderr)
+            return 2
+        if args.yes and not args.dry_run and args.older_than is None:
+            print("error: sessions gc --yes requires --older-than DAYS.", file=sys.stderr)
+            return 2
+        targets = collect_gc_targets(cwd=args.cwd, config_home=args.config_home, older_than_days=args.older_than)
+        dry_run = (not args.yes) or args.dry_run
+        if args.json_output:
+            payload: dict[str, Any] = {"dryRun": dry_run, "targets": targets}
+            if not dry_run:
+                payload["deleted"] = delete_gc_targets(targets)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        if not targets:
+            print("No sessions eligible for GC.")
+            return 0
+        if not dry_run:
+            for path in delete_gc_targets(targets):
+                print(f"deleted {path}")
+        else:
+            print("Dry run. Pass --yes to delete:")
+            for target in targets:
+                print(f"{target['sessionId']}\t{target['transcriptPath']}")
         return 0
 
     if args.memory_status:
@@ -1942,16 +2318,97 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print(f"remembered {path}")
         return 0
 
+    if args.memory_extract:
+        try:
+            candidates = load_candidate_json(args.candidate_json) if args.candidate_json is not None else extract_memory_candidates(
+                args.memory_extract,
+                cwd=args.cwd,
+                config_home=args.config_home,
+            )
+            if args.yes and not args.dry_run:
+                result = apply_memory_candidates(
+                    candidates,
+                    session_id=args.memory_extract,
+                    cwd=args.cwd,
+                    config_home=args.config_home,
+                    memory_enabled=local_config.memory_enabled,
+                    memory_default_path=local_config.memory_default_path,
+                )
+                if args.json_output:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(f"wrote {len(result['written'])} memory files")
+                    for item in result["written"]:
+                        print(item["path"])
+                return 0
+            payload = {"sessionId": args.memory_extract, "dryRun": True, "candidates": [candidate.as_json() for candidate in candidates]}
+            if args.json_output:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            elif not candidates:
+                print("No memory candidates found.")
+            else:
+                for candidate in candidates:
+                    warnings = f" warnings={','.join(candidate.warnings)}" if candidate.warnings else ""
+                    print(f"{candidate.type}\t{candidate.path}\t{candidate.name}{warnings}")
+            return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     if args.memory_validate:
-        issues = validate_memory(cwd=args.cwd, config_home=args.config_home, memory_enabled=local_config.memory_enabled)
+        result = validate_memory_store(
+            cwd=args.cwd,
+            config_home=args.config_home,
+            memory_enabled=local_config.memory_enabled,
+            memory_default_path=local_config.memory_default_path,
+        )
         if args.json_output:
-            print(json.dumps({"issues": issues}, ensure_ascii=False, indent=2))
-        elif issues:
-            for issue in issues:
-                print(issue)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result["issues"]:
+            for issue in result["issues"]:
+                print(f"{issue['code']}: {issue.get('path', '')}")
         else:
             print("memory ok")
-        return 1 if issues else 0
+        return 1 if result["issues"] else 0
+
+    if args.memory_rebuild_index:
+        result = rebuild_memory_index(
+            cwd=args.cwd,
+            config_home=args.config_home,
+            memory_enabled=local_config.memory_enabled,
+            memory_default_path=local_config.memory_default_path,
+            apply=bool(args.yes and not args.dry_run),
+        )
+        if args.json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result["status"] == "applied":
+            print(f"rebuilt {result['indexPath']}")
+            if result["backupPath"]:
+                print(f"backup={result['backupPath']}")
+        else:
+            print("Dry run. Pass --yes to rewrite MEMORY.md:")
+            for line in result["lines"]:
+                print(line)
+        return 0
+
+    if args.memory_provenance:
+        try:
+            result = memory_provenance(
+                args.memory_provenance,
+                cwd=args.cwd,
+                config_home=args.config_home,
+                memory_enabled=local_config.memory_enabled,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if args.json_output:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif result["provenance"] is None:
+            print(f"No provenance for {result['path']}.")
+        else:
+            print(json.dumps(result["provenance"], ensure_ascii=False, indent=2))
+        return 0
 
     if args.list_skills:
         if not skills_dirs:
@@ -2027,23 +2484,34 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 2
 
     if args.mcp_validate_config:
-        clients: tuple[MCPClientConfig, ...] = ()
         try:
-            clients = load_mcp_clients_for_runner(
-                configs=(args.mcp_validate_config,),
-                cwd=args.cwd,
+            static_mcp_config_summary(args.mcp_validate_config)
+            print("mcp config ok")
+            return 0
+        except MCPConfigurationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    if args.mcp_doctor and not args.mcp_start:
+        try:
+            summary = _mcp_static_summaries(
+                mcp_fixtures,
+                mcp_configs,
                 startup_timeout_seconds=local_config.mcp_startup_timeout,
                 tool_timeout_seconds=local_config.mcp_tool_timeout,
             )
-            print("mcp config ok")
+            if args.json_output:
+                print(json.dumps({"started": False, "servers": summary}, ensure_ascii=False, indent=2))
+            else:
+                print(f"mcp ok ({len(summary)} servers) started=false")
+                for server in summary:
+                    print(f"{server['name']}\ttype={server.get('type')} started=false")
             return 0
         except (MCPConfigurationError, MCPFixtureConfigurationError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        finally:
-            close_mcp_clients(clients)
 
-    if args.mcp_list or args.mcp_doctor:
+    if args.mcp_list or args.mcp_doctor or args.mcp_inspect:
         clients: tuple[MCPClientConfig, ...] = ()
         try:
             clients = load_mcp_clients_for_runner(
@@ -2054,10 +2522,32 @@ async def _run_cli(args: argparse.Namespace) -> int:
                 tool_timeout_seconds=local_config.mcp_tool_timeout,
             )
             summary = mcp_clients_summary(clients)
+            if args.mcp_inspect:
+                server = next(
+                    (
+                        item
+                        for item in summary
+                        if item["name"] == args.mcp_inspect or item["normalizedName"] == normalize_name_for_mcp(args.mcp_inspect)
+                    ),
+                    None,
+                )
+                if server is None:
+                    available = ", ".join(item["name"] for item in summary) or "none"
+                    print(f"error: MCP server not found: {args.mcp_inspect}. Available: {available}", file=sys.stderr)
+                    return 2
+                if args.json_output:
+                    print(json.dumps(server, ensure_ascii=False, indent=2))
+                else:
+                    print(f"{server['name']}\ttype={server['type']}")
+                    for tool in server["toolDetails"]:
+                        print(f"tool\t{tool['fullName']}")
+                    for resource in server["resources"]:
+                        print(f"resource\t{resource}")
+                return 0
             if args.json_output:
-                print(json.dumps({"servers": summary}, ensure_ascii=False, indent=2))
+                print(json.dumps({"started": True, "servers": summary}, ensure_ascii=False, indent=2))
             elif args.mcp_doctor:
-                print(f"mcp ok ({len(summary)} servers)")
+                print(f"mcp ok ({len(summary)} servers) started=true")
                 for server in summary:
                     print(f"{server['name']}\ttools={len(server['tools'])}\tresources={len(server['resources'])}")
             else:
@@ -2135,6 +2625,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         engine = build_local_engine(
             cwd=args.cwd,
             config_home=args.config_home,
+            settings_paths=local_config.paths,
             model_provider=_NoopModelProvider() if debug_tools else None,
             session_id=session_id,
             model=model,
@@ -2176,7 +2667,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
 
     def observe_event(event: dict[str, Any]) -> None:
         if json_events:
-            print(json.dumps(event, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
+            payload = {"schemaVersion": "0.6", **event}
+            print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), file=sys.stderr)
 
     prompt = " ".join(args.prompt).strip()
     try:
@@ -2200,6 +2692,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
                     event_observer=observe_event,
                 )
                 print(result.final_response)
+                if args.print_session_id:
+                    print(f"session={result.session_id}", file=sys.stderr)
                 if print_transcript_path:
                     print(f"transcript={result.transcript_path}", file=sys.stderr)
             return 0
@@ -2214,6 +2708,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
             return 2
         result = await run_local_agent_once(prompt, engine=engine, max_turns=max_turns, event_logger=log, event_observer=observe_event)
         print(result.final_response)
+        if args.print_session_id:
+            print(f"session={result.session_id}", file=sys.stderr)
         if print_transcript_path:
             print(f"transcript={result.transcript_path}", file=sys.stderr)
         return 0
@@ -2229,9 +2725,17 @@ def _expand_management_command(argv: Sequence[str] | None) -> list[str] | None:
     if not raw or raw[0].startswith("-"):
         return list(raw) if argv is not None else None
     head, *tail = raw
+    if head == "doctor":
+        expanded = ["--doctor"]
+        for item in tail:
+            expanded.append("--doctor-full" if item == "--full" else item)
+        return expanded
+    if head == "workspace":
+        if not tail or tail[0] in {"doctor", "status"}:
+            return ["--workspace-doctor", *tail[1:]]
     if head == "config":
         if not tail or tail[0] in {"doctor", "status"}:
-            return ["--doctor", *tail[1:]]
+            return ["--doctor", *("--doctor-full" if item == "--full" else item for item in tail[1:])]
         if tail[0] == "doctor-json":
             return ["--doctor-json", *tail[1:]]
         if tail[0] == "init":
@@ -2252,12 +2756,21 @@ def _expand_management_command(argv: Sequence[str] | None) -> list[str] | None:
             return ["--list-sessions", *tail[1:]]
         if tail[0] == "info" and len(tail) >= 2:
             return ["--session-info", tail[1], *tail[2:]]
+        if tail[0] == "inspect" and len(tail) >= 2:
+            return ["--session-inspect", tail[1], *tail[2:]]
+        if tail[0] == "validate" and len(tail) >= 2:
+            return ["--session-validate", tail[1], *tail[2:]]
+        if tail[0] == "timeline" and len(tail) >= 2:
+            return ["--session-timeline", tail[1], *tail[2:]]
         if tail[0] in {"path", "transcript-path"} and len(tail) >= 2:
             return ["--session-transcript-path", tail[1], *tail[2:]]
         if tail[0] == "export" and len(tail) >= 2:
-            return ["--session-export", tail[1], *tail[2:]]
+            expanded_tail = ["--session-export-redacted" if item == "--redacted" else item for item in tail[2:]]
+            return ["--session-export", tail[1], *expanded_tail]
         if tail[0] == "delete" and len(tail) >= 2:
             return ["--session-delete", tail[1], *tail[2:]]
+        if tail[0] == "gc":
+            return ["--session-gc", *tail[1:]]
     if head == "memory":
         if not tail or tail[0] == "status":
             return ["--memory-status", *tail[1:]]
@@ -2277,11 +2790,20 @@ def _expand_management_command(argv: Sequence[str] | None) -> list[str] | None:
             return ["--memory-forget", tail[1], *tail[2:]]
         if tail[0] == "validate":
             return ["--memory-validate", *tail[1:]]
+        if tail[0] == "extract" and len(tail) >= 2:
+            return ["--memory-extract", tail[1], *tail[2:]]
+        if tail[0] == "rebuild-index":
+            return ["--memory-rebuild-index", *tail[1:]]
+        if tail[0] == "provenance" and len(tail) >= 2:
+            return ["--memory-provenance", tail[1], *tail[2:]]
     if head == "mcp":
         if not tail or tail[0] == "list":
             return ["--mcp-list", *tail[1:]]
         if tail[0] == "doctor":
-            return ["--mcp-doctor", *tail[1:]]
+            expanded_tail = ["--mcp-start" if item == "--start" else item for item in tail[1:]]
+            return ["--mcp-doctor", *expanded_tail]
+        if tail[0] == "inspect" and len(tail) >= 2:
+            return ["--mcp-inspect", tail[1], *tail[2:]]
         if tail[0] == "validate-config" and len(tail) >= 2:
             return ["--mcp-validate-config", tail[1], *tail[2:]]
     return list(raw) if argv is not None else None

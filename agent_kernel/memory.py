@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import KernelConfig
-from .path_utils import find_git_root, sanitize_path
 
 ENTRYPOINT_NAME = "MEMORY.md"
 MAX_ENTRYPOINT_LINES = 200
@@ -181,9 +180,10 @@ class MemoryLoader:
         if self.auto_memory_path_override is not None:
             # 测试和嵌入式调用可覆盖路径，但不改变默认项目键算法。
             return self.auto_memory_path_override
-        # git root 让同一仓库不同子目录共享 memory；非 git 项目退回 cwd。
-        base = find_git_root(self.config.cwd) or self.config.cwd
-        return self.config.config_home / "projects" / sanitize_path(base) / "memory"
+        runtime = self.config.workspace_runtime
+        if runtime.memory_dir is None:
+            return runtime.project_store_dir / "memory"
+        return runtime.memory_dir
 
     def get_daily_log_path(self) -> Path:
         """获取daily log 路径，供项目 memory流程使用。"""

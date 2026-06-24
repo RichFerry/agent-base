@@ -179,6 +179,8 @@ class KernelConfig:
     # 路径/环境字段会进入 prompt、权限和 transcript，因此必须由同一实例共享。
     cwd: Path = field(default_factory=lambda: Path.cwd())
     config_home: Path = field(default_factory=get_config_home)
+    workspace_root: Path | None = None
+    settings_paths: tuple[Path, ...] = ()
     session_start_date: str = field(default_factory=local_iso_date)
     platform: str = field(default_factory=lambda: "win32" if os.name == "nt" else "darwin" if platform.system() == "Darwin" else "linux")
     shell: str = field(default_factory=shell_name)
@@ -197,6 +199,8 @@ class KernelConfig:
     context_compaction: ContextCompactionConfig = field(default_factory=ContextCompactionConfig)
     # 扩展声明保持不可变 tuple；QueryEngine 初始化时解析成运行对象。
     mcp_clients: tuple[MCPClientConfig, ...] = ()
+    mcp_config_paths: tuple[Path, ...] = ()
+    mcp_fixture_paths: tuple[Path, ...] = ()
     skills: tuple[SkillConfig, ...] = ()
     skill_paths: tuple[Path, ...] = ()
     skill_discovery_mode: str = "ambient"
@@ -204,3 +208,20 @@ class KernelConfig:
     agent_paths: tuple[Path, ...] = ()
     disable_builtin_agents: bool = False
     output_style: OutputStyleConfig | None = None
+
+    @property
+    def workspace_runtime(self):
+        """Return resolved workspace storage and extension boundary facts."""
+        from .workspace import build_workspace_runtime
+
+        return build_workspace_runtime(
+            cwd=self.cwd,
+            config_home=self.config_home,
+            workspace_root=self.workspace_root,
+            settings_paths=self.settings_paths,
+            skill_paths=self.skill_paths,
+            mcp_config_paths=self.mcp_config_paths,
+            mcp_fixture_paths=self.mcp_fixture_paths,
+            mcp_server_names=(client.name for client in self.mcp_clients),
+            memory_enabled=self.auto_memory_enabled,
+        )

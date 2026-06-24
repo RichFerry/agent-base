@@ -42,7 +42,7 @@ agent-kernel-local --help
 包信息：
 
 - 包名：`agent-kernel`
-- 当前版本：`0.5.0`
+- 当前版本：`0.7.0`
 - Python 版本：`>=3.11`
 - 运行时依赖：无
 
@@ -135,6 +135,8 @@ agent-kernel-local --permission-mode ask "Summarize this project in one sentence
 agent-kernel-local --repl
 agent-kernel-local --init-config
 agent-kernel-local --doctor
+agent-kernel-local workspace doctor
+agent-kernel-local workspace doctor --json
 agent-kernel-local config doctor
 agent-kernel-local config effective
 agent-kernel-local --list-sessions
@@ -145,6 +147,10 @@ agent-kernel-local --memory-status
 agent-kernel-local memory list
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
+agent-kernel-local mcp doctor --start --json
+agent-kernel-local sessions validate SESSION_ID --json
+agent-kernel-local sessions timeline SESSION_ID
+agent-kernel-local memory extract SESSION_ID --dry-run
 ```
 
 权限模式：
@@ -154,7 +160,7 @@ agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer conc
 
 ### 本地 Config
 
-v0.5.0 使用 `settings.json` 作为官方本地 runner 配置文件：
+Agent Base 使用 `settings.json` 作为官方本地 runner 配置文件：
 
 ```bash
 agent-kernel-local --init-config
@@ -179,6 +185,80 @@ memory 默认行为，以及 debug flags。
 ```
 
 不要把 API key、token、password 或其它 secret 写进 `settings.json`。
+
+### v0.7 Workspace Runtime
+
+v0.7.0 把 workspace identity 做成 kernel 和 local runner 共享的统一运行时视图。
+现在 agent 可以明确知道：
+
+- 当前 `cwd`
+- workspace root，以及它来自 git discovery 还是显式 cwd
+- 已加载的 `settings.json` 来源
+- Skills 与 MCP 配置来源属于 project / user / explicit 哪一类
+- project 级 sessions、transcripts、memory、artifacts 的位置
+- act/bypass 模式下允许的工作目录边界
+
+这些信息不需要 credentials、网络或 MCP 启动即可检查：
+
+```bash
+agent-kernel-local workspace doctor
+agent-kernel-local workspace doctor --json
+agent-kernel-local --print-effective-config
+```
+
+Workspace 存储位于 config home 下的 project bucket：
+
+```text
+<config_home>/projects/<workspace-key>/
+  *.jsonl
+  memory/
+  artifacts/
+    bash-output/
+    agent-output/
+```
+
+如果 `cwd` 位于 git 仓库中，workspace key 基于 git root，因此同一项目的不同子目录会
+共享 sessions 和 memory。act/bypass 的文件边界仍然保持保守：默认只有当前 `cwd`
+和显式 additional working directories 被视为允许工作路径。
+
+### v0.6 MCP / Sessions / Memory 全链路
+
+v0.6.0 把本地 MCP、JSONL sessions 和显式 memory extraction 串成一条可审计链路：
+
+```text
+MCP fixture/config/stdin
+-> QueryEngine tool registry
+-> MCP tool/resource result
+-> SDK events and JSONL transcript
+-> sessions validate/inspect/timeline/export
+-> memory extract dry-run
+-> memory extract --yes 写 memory files 和 MEMORY.md
+-> resume 保持 transcript ordering 并加载 memory prompt
+```
+
+常用命令：
+
+```bash
+agent-kernel-local mcp doctor --json
+agent-kernel-local mcp doctor --start --json
+agent-kernel-local mcp inspect local-echo --mcp-fixture examples/mcp/echo-mcp.json --json
+
+agent-kernel-local sessions inspect SESSION_ID --json
+agent-kernel-local sessions validate SESSION_ID --json
+agent-kernel-local sessions timeline SESSION_ID
+agent-kernel-local sessions export SESSION_ID --redacted
+agent-kernel-local sessions gc --dry-run --older-than 30
+
+agent-kernel-local memory extract SESSION_ID --dry-run --json
+agent-kernel-local memory extract SESSION_ID --yes
+agent-kernel-local memory validate --json
+agent-kernel-local memory rebuild-index --dry-run
+agent-kernel-local memory provenance reference/example.md --json
+```
+
+Memory extraction 仍然只允许手动触发。dry-run 不修改文件；`--yes` 会写入 memory
+文件、更新 `MEMORY.md`、保存 provenance sidecar，并在对应 session transcript 中记录
+可见的 extraction event。MCP resource memory 默认保存引用指针，不复制原始 resource dump。
 
 ## 可选能力
 
@@ -392,6 +472,7 @@ python3 -m compileall agent_kernel tests
 
 ```bash
 python3 -m pytest tests/test_local_agent_runner.py -q
+python3 -m pytest tests/test_workspace_runtime.py -q
 python3 -m pytest tests/test_packaging.py -q
 ```
 
@@ -437,12 +518,15 @@ AGENT_KERNEL_RUN_REAL_MCP_SMOKE=1 python3 -m pytest tests/test_real_mcp_smoke.py
 - `docs/mcp-v0.5.md`：v0.5 本地 MCP config hardening 说明。
 - `docs/cli-v0.5.md`：v0.5 本地 CLI 日常使用说明。
 - `docs/release-v0.5.md`：v0.5 release readiness 说明。
+- `docs/release-v0.6.md`：v0.6 MCP / Sessions / Memory 链路说明。
+- `docs/mcp-memory-session-v0.6.md`：v0.6 全链路工作流说明。
+- `docs/release-v0.7.md`：v0.7 Workspace Runtime 说明。
 - `docs/smoke-v0.3.md`：手动真实 smoke 配置。
 - `CHANGELOG.md`：发布变更记录。
 
 ## 项目状态
 
-当前 release：`v0.5.0`。
+当前 release：`v0.7.0`。
 
 本仓库是用于本地实验和扩展的 kernel 与 example runner。它的目标是在加入更大产品外壳之前，
 保持行为可观察、可测试。

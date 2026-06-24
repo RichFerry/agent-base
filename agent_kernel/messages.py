@@ -218,24 +218,28 @@ def normalize_messages_for_api(messages: list[Message]) -> list[Message]:
             }
 
         if role == "user":
-            # tool_reference 依赖特定 beta；默认 API 请求必须删除它。
+            # tool_reference 和 transcript-only metadata 依赖内核/特定 beta；
+            # 默认 API 请求必须删除它们，但不能修改 transcript 原对象。
             normalized_content: list[dict[str, Any]] = []
             for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result" or not isinstance(block.get("content"), list):
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
                     normalized_content.append(block)
                     continue
-                inner_content = [
-                    inner
-                    for inner in block["content"]
-                    if not (isinstance(inner, dict) and inner.get("type") == "tool_reference")
-                ]
-                normalized_content.append(
-                    {
-                        **block,
-                        "content": inner_content
-                        or [{"type": "text", "text": "[Tool references removed - tool search not enabled]"}],
-                    }
-                )
+                result_content = block.get("content", NO_CONTENT_MESSAGE)
+                if isinstance(result_content, list):
+                    result_content = [
+                        inner
+                        for inner in result_content
+                        if not (isinstance(inner, dict) and inner.get("type") == "tool_reference")
+                    ] or [{"type": "text", "text": "[Tool references removed - tool search not enabled]"}]
+                sanitized = {
+                    "type": "tool_result",
+                    "tool_use_id": block.get("tool_use_id"),
+                    "content": result_content,
+                }
+                if block.get("is_error"):
+                    sanitized["is_error"] = True
+                normalized_content.append(sanitized)
             if normalized_content != content:
                 api_message = {**api_message, "message": {**payload, "content": normalized_content}}
             if normalized and normalized[-1].get("type") == "user":

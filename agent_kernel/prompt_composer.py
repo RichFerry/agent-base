@@ -308,8 +308,17 @@ def compute_simple_env_info(
     )
     cutoff = get_knowledge_cutoff(model_id)
     knowledge_cutoff_message = f"Assistant knowledge cutoff is {cutoff}." if cutoff else None
+    runtime = config.workspace_runtime
     env_items: list[str | list[str]] = [
         f"Primary working directory: {config.cwd}",
+        f"Workspace root: {runtime.workspace_root}",
+        f"Workspace root source: {runtime.workspace_root_source}",
+        f"Session transcripts directory: {runtime.transcript_dir}",
+        f"Workspace artifacts directory: {runtime.artifacts_dir}",
+        f"Memory scope: {runtime.memory_scope}",
+        f"Memory directory: {runtime.memory_dir if runtime.memory_dir is not None else 'disabled'}",
+        "Act mode allowed working directories:",
+        [str(path) for path in runtime.allowed_working_directories],
         [f"Is a git repository: {str(is_git_repo(config.cwd)).lower()}"],
     ]
     if additional_working_directories:
@@ -404,8 +413,9 @@ class PromptComposer:
         """按源码 section 顺序返回 system prompt 数组。"""
         if self.config.simple_mode:
             # simple mode 刻意跳过工具、memory 和风格段，提供最小 system prompt。
+            runtime = self.config.workspace_runtime
             return [
-                f"You are Agent Base, a local agent CLI.\n\nCWD: {self.config.cwd}\nDate: {self.config.session_start_date}"
+                f"You are Agent Base, a local agent CLI.\n\nCWD: {self.config.cwd}\nWorkspace root: {runtime.workspace_root}\nDate: {self.config.session_start_date}"
             ]
         enabled_tools = {getattr(tool, "name", "") for tool in tools}
         skills = load_skills(self.config)

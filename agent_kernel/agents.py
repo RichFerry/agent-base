@@ -1044,7 +1044,7 @@ async def run_subagent(
 
 def _agent_output_path(config: KernelConfig, agent_id: str) -> Path:
     """完成 ``_agent_output_path`` 对应的subagent 定义与执行内部步骤。"""
-    output_dir = config.config_home / "agent-output"
+    output_dir = config.workspace_runtime.agent_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{agent_id}.log"
 

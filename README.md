@@ -43,7 +43,7 @@ agent-kernel-local --help
 Package facts:
 
 - Package name: `agent-kernel`
-- Current version: `0.5.0`
+- Current version: `0.7.0`
 - Python: `>=3.11`
 - Runtime dependencies: none
 
@@ -139,6 +139,8 @@ agent-kernel-local --permission-mode ask "Summarize this project in one sentence
 agent-kernel-local --repl
 agent-kernel-local --init-config
 agent-kernel-local --doctor
+agent-kernel-local workspace doctor
+agent-kernel-local workspace doctor --json
 agent-kernel-local config doctor
 agent-kernel-local config effective
 agent-kernel-local --list-sessions
@@ -149,6 +151,10 @@ agent-kernel-local --memory-status
 agent-kernel-local memory list
 agent-kernel-local --memory-read
 agent-kernel-local --memory-write notes/preference.md --memory-text "Prefer concise answers."
+agent-kernel-local mcp doctor --start --json
+agent-kernel-local sessions validate SESSION_ID --json
+agent-kernel-local sessions timeline SESSION_ID
+agent-kernel-local memory extract SESSION_ID --dry-run
 ```
 
 Permission modes:
@@ -158,7 +164,7 @@ Permission modes:
 
 ### Local Config
 
-v0.5.0 uses `settings.json` as the official local runner config file:
+Agent Base uses `settings.json` as the official local runner config file:
 
 ```bash
 agent-kernel-local --init-config
@@ -187,6 +193,83 @@ Example:
 ```
 
 Do not store API keys, tokens, passwords, or secrets in `settings.json`.
+
+### v0.7 Workspace Runtime
+
+v0.7.0 makes workspace identity explicit and shared across the kernel and local
+runner. The agent now has one runtime view for:
+
+- current `cwd`
+- workspace root and whether it came from git discovery or the explicit cwd
+- loaded `settings.json` sources
+- configured Skills and MCP source scope
+- project-scoped sessions, transcripts, memory, and artifacts
+- act/bypass allowed working directories
+
+Inspect it without credentials, network, or MCP startup:
+
+```bash
+agent-kernel-local workspace doctor
+agent-kernel-local workspace doctor --json
+agent-kernel-local --print-effective-config
+```
+
+Workspace storage is project-scoped under the config home:
+
+```text
+<config_home>/projects/<workspace-key>/
+  *.jsonl
+  memory/
+  artifacts/
+    bash-output/
+    agent-output/
+```
+
+If `cwd` is inside a git repository, the workspace key is based on the git root
+so sessions and memory are shared across subdirectories of the same project.
+The act/bypass file boundary remains conservative: only the current `cwd` and
+explicit additional working directories are considered allowed working paths.
+
+### v0.6 MCP / Sessions / Memory Chain
+
+v0.6.0 connects local MCP, JSONL sessions, and explicit memory extraction into
+one auditable workflow:
+
+```text
+MCP fixture/config/stdin
+-> QueryEngine tool registry
+-> MCP tool/resource result
+-> SDK events and JSONL transcript
+-> sessions validate/inspect/timeline/export
+-> memory extract dry-run
+-> memory extract --yes writes memory files and MEMORY.md
+-> resume keeps transcript ordering and loads the memory prompt
+```
+
+Useful commands:
+
+```bash
+agent-kernel-local mcp doctor --json
+agent-kernel-local mcp doctor --start --json
+agent-kernel-local mcp inspect local-echo --mcp-fixture examples/mcp/echo-mcp.json --json
+
+agent-kernel-local sessions inspect SESSION_ID --json
+agent-kernel-local sessions validate SESSION_ID --json
+agent-kernel-local sessions timeline SESSION_ID
+agent-kernel-local sessions export SESSION_ID --redacted
+agent-kernel-local sessions gc --dry-run --older-than 30
+
+agent-kernel-local memory extract SESSION_ID --dry-run --json
+agent-kernel-local memory extract SESSION_ID --yes
+agent-kernel-local memory validate --json
+agent-kernel-local memory rebuild-index --dry-run
+agent-kernel-local memory provenance reference/example.md --json
+```
+
+Memory extraction is manual only. Dry-run mutates nothing; `--yes` writes memory
+files, updates `MEMORY.md`, stores provenance sidecars, and records a
+session-visible extraction event. MCP resource memories store pointers, not raw
+resource dumps.
 
 ## Optional Capabilities
 
@@ -405,6 +488,7 @@ Focused checks:
 
 ```bash
 python3 -m pytest tests/test_local_agent_runner.py -q
+python3 -m pytest tests/test_workspace_runtime.py -q
 python3 -m pytest tests/test_packaging.py -q
 ```
 
@@ -450,12 +534,15 @@ See `docs/smoke-v0.3.md` for setup and safety details.
 - `docs/mcp-v0.5.md`: v0.5 local MCP config hardening notes.
 - `docs/cli-v0.5.md`: v0.5 local CLI daily-use notes.
 - `docs/release-v0.5.md`: v0.5 release readiness notes.
+- `docs/release-v0.6.md`: v0.6 MCP / Sessions / Memory chain notes.
+- `docs/mcp-memory-session-v0.6.md`: v0.6 full-chain workflow notes.
+- `docs/release-v0.7.md`: v0.7 Workspace Runtime notes.
 - `docs/smoke-v0.3.md`: manual real smoke setup.
 - `CHANGELOG.md`: release changelog.
 
 ## Project Status
 
-Current release: `v0.5.0`.
+Current release: `v0.7.0`.
 
 This repository is a kernel and example runner for local experimentation and
 extension. It is designed to keep behavior observable and testable before adding

@@ -285,7 +285,7 @@ def _detect_blocked_sleep_pattern(command: str) -> str | None:
 
 def _background_output_path(context: ToolUseContext, task_id: str) -> Path:
     """完成 ``_background_output_path`` 对应的Bash 工具内部步骤。"""
-    output_dir = context.config.config_home / "bash-output"
+    output_dir = context.config.workspace_runtime.bash_output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{task_id}.log"
 

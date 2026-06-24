@@ -91,13 +91,22 @@ class SessionStore:
 
     @property
     def project_dir(self) -> Path:
-        """返回当前 cwd 对应的 Claude projects 存储目录。"""
+        """返回当前 workspace 对应的项目 transcript 存储目录。"""
+        return self.config.workspace_runtime.sessions_dir
+
+    @property
+    def legacy_project_dir(self) -> Path:
+        """Return the pre-v0.7 cwd-keyed transcript directory for resume compatibility."""
         return self.config.config_home / "projects" / sanitize_path(self.config.cwd)
 
     @property
     def transcript_path(self) -> Path:
         """返回当前 session 的 JSONL transcript 文件路径。"""
-        return self.project_dir / f"{self.session_id}.jsonl"
+        path = self.project_dir / f"{self.session_id}.jsonl"
+        legacy_path = self.legacy_project_dir / f"{self.session_id}.jsonl"
+        if legacy_path != path and legacy_path.exists() and not path.exists():
+            return legacy_path
+        return path
 
     def record_transcript(self, messages: list[Message]) -> None:
         """追加尚未写入的消息，并更新 parentUuid 链。"""

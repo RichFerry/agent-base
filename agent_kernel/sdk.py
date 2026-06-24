@@ -205,10 +205,20 @@ def build_system_init_message(
     agents = agents or []
     skills = skills or []
     plugins = plugins or []
+    workspace = config.workspace_runtime
     return {
         "type": "system",
         "subtype": "init",
         "cwd": str(config.cwd),
+        "workspace": {
+            "root": str(workspace.workspace_root),
+            "rootSource": workspace.workspace_root_source,
+            "sessionsDir": str(workspace.sessions_dir),
+            "memoryScope": workspace.memory_scope,
+            "memoryDir": str(workspace.memory_dir) if workspace.memory_dir is not None else None,
+            "artifactsDir": str(workspace.artifacts_dir),
+            "allowedWorkingDirectories": [str(path) for path in workspace.allowed_working_directories],
+        },
         "session_id": session_id,
         "tools": [sdk_compat_tool_name(tool.name) for tool in tools],
         "mcp_servers": [{"name": client.name, "status": client.type} for client in config.mcp_clients],

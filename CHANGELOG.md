@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0
+
+- Added an internal Workspace Runtime that resolves cwd, workspace root, config home, project store, sessions, memory, artifacts, settings sources, Skills sources, MCP sources, and act-mode allowed working directories.
+- Anchored JSONL sessions, project memory, Bash background output, and Agent output under one workspace project store.
+- Added `agent-kernel-local workspace doctor` and `workspace doctor --json` for credential-free workspace diagnostics.
+- Added workspace metadata to SDK `system/init` events and model-facing environment context.
+- Kept permission modes limited to `ask` and `bypass`; no permission profiles or interactive permission UI were added.
+
+## 0.6.0
+
+- Added MCP result metadata for local tool/resource calls so transcript and SDK events can be audited without changing the core tool loop.
+- Added session validation, inspection, timeline, redacted export, and dry-run/confirmed GC commands.
+- Added deterministic manual memory extraction from session transcripts, candidate JSON application, provenance sidecars, memory validation, and index rebuild commands.
+- Added static MCP doctor, explicit `mcp doctor --start`, and MCP inspect diagnostics.
+- Added v0.6 JSON event schema version metadata in the local runner.
+- Added v0.6 docs for the MCP / Sessions / Memory full-chain workflow.
+
 ## 0.5.0
 
 - Added layered `settings.json` local runner settings with secret rejection, redacted doctor output, and effective config diagnostics.
